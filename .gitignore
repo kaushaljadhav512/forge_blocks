@@ -1,0 +1,14 @@
+# Training outputs stay on the training PC
+logs/
+outputs/
+runs/
+results/
+*.pth
+# Exported policies go through GitHub Releases or scp, not git
+exports/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.vscode/

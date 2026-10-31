@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge_blocks"
+version = "0.1.0"
+description = "FORGE force-guided insertion baseline for block-in-slot on the Franka (Isaac Lab v2.3.2)"
+requires-python = ">=3.10"
+# Isaac Lab, isaaclab_tasks and rl_games come from the Isaac Lab install on the training PC.
+dependencies = ["gymnasium", "numpy"]
+
+[tool.setuptools.packages.find]
+include = ["forge_blocks*"]
+
+[tool.setuptools.package-data]
+forge_blocks = ["assets/*.usda"]
