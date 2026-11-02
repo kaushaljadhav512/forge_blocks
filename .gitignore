@@ -12,3 +12,6 @@ __pycache__/
 *.egg-info/
 .venv/
 .vscode/
+
+# Personal notes, not shared
+notes/

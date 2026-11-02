@@ -33,10 +33,12 @@ YAW_NOISE_DEG = 0.0
 
 @configclass
 class BlockObsRandCfg(ForgeObsRandCfg):
-    # If enabled, xy estimate error has radius U[r_min, r_max] (metres) instead of FORGE's per-axis
-    # Gaussian. A flag rather than None so Hydra CLI overrides keep the list's type/length.
-    use_xy_radius: bool = False
-    fixed_asset_pos_xy_radius: list = [0.0, 0.0]
+    # The paper trains with sigma = 2.5 mm (Table II); upstream defaults to 1 mm.
+    fixed_asset_pos = [0.0025, 0.0025, 0.0025]
+    # "gaussian" uses fixed_asset_pos. "xy" and "xyz" use a radius from U[error_radius] in metres;
+    # see block_env.py. A string and list rather than None so Hydra overrides keep their types.
+    error_radius_mode: str = "gaussian"
+    error_radius: list = [0.0, 0.0]
 
 
 @configclass
@@ -107,7 +109,11 @@ class ForgeBlock1mmCfg(ForgeBlockEnvCfg):
 
 @configclass
 class ForgePegCfg(ForgeTaskPegInsertCfg):
-    """Upstream FORGE peg insert, with our radius option. Same observations as
-    Isaac-Forge-PegInsert-Direct-v0, so checkpoints from either ID are interchangeable."""
+    """FORGE's 8 mm peg with the paper's noise and fixed velocity observations.
+
+    Friction is left at upstream's values: held 0.75 and fixed (0.25, 1.25) static average to the
+    paper's [0.5, 1.0] under PhysX's default combine mode. Checkpoints are not interchangeable with
+    Isaac-Forge-PegInsert-Direct-v0, because the velocity observations differ.
+    """
 
     obs_rand: BlockObsRandCfg = BlockObsRandCfg()

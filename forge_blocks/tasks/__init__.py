@@ -26,7 +26,7 @@ def _register(task_id: str, cfg_name: str) -> None:
     )
 
 
-# Phase 1 reference: FORGE's 8 mm peg, plus the radius-error option for eval_sweep.
+# Phase 1 reference: FORGE's 8 mm peg with the paper's noise and fixed velocity observations.
 _register("Isaac-ForgeBlocks-Peg8mm-Direct-v0", "ForgePegCfg")
 
 for _c in CLEARANCES_MM:

@@ -5,7 +5,10 @@ ForgeEnv does around the policy (isaaclab_tasks/direct/forge/forge_env.py @ v2.3
 
   observation  _get_observations: fingertip pose relative to the *estimated* slot opening,
                quat with w and z zeroed, finite-diff velocities (angular: z only), smoothed
-               world-frame contact force, force threshold, previous (smoothed) actions
+               world-frame contact force, force threshold, previous (smoothed) actions.
+               Compute the velocities over about 1/120 s on the robot, as forge_blocks does in
+               sim, not over the 1/15 s policy step. Don't use with upstream checkpoints: their
+               velocity inputs are noise (Isaac Lab issue #8874).
   action       _pre_physics_step: EMA of the clamped policy mean
                _apply_action:     targets relative to the estimated slot, clipped to a step
                                   around the current fingertip pose, upright orientation
