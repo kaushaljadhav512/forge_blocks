@@ -1,0 +1,23 @@
+# Finishes Isaac Lab v2.3.2's install. Its own build reports success even though the core isaaclab
+# package fails to install: flatdict==4.0.1 needs pkg_resources, which pip's isolated build no longer
+# gets from the newest setuptools. Without isaaclab, gymnasium isn't pinned either.
+#
+# packaging must also stay below 24. isaaclab_rl requires that, and upgrading it deletes Isaac Sim's
+# bundled copy, which pip's own vendored files are symlinks into, so pip stops working.
+FROM isaac-lab-base
+
+RUN printf 'setuptools<81\npackaging<24\n' > /tmp/build-constraints.txt && \
+    PIP_CONSTRAINT=/tmp/build-constraints.txt \
+        ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install --editable ${ISAACLAB_PATH}/source/isaaclab && \
+    rm /tmp/build-constraints.txt
+
+# Upstream's Dockerfile removes this too; installing isaaclab can bring it back.
+RUN ${ISAACLAB_PATH}/isaaclab.sh -p -m pip uninstall -y quadprog
+
+# isaaclab.sh can hide install failures, so check the result here. isaaclab_tasks can't be imported
+# yet: it needs pxr, which only exists once the Isaac Sim app has started.
+RUN ${ISAACLAB_PATH}/isaaclab.sh -p -c "import importlib.metadata as m; \
+assert m.version('isaaclab') == '0.54.2', m.version('isaaclab'); \
+assert m.version('gymnasium') == '1.2.1', m.version('gymnasium'); \
+assert m.version('packaging').startswith('23.'), m.version('packaging'); \
+import flatdict, isaaclab, rl_games; print('install check passed')"

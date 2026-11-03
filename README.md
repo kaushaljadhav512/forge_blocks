@@ -59,6 +59,8 @@ These remain different from the paper:
 
 ## Training PC setup (RTX 4080)
 
+On a shared PC, use Docker instead of the steps below: see [docker/README.md](docker/README.md). Next steps are in [TODO.md](TODO.md).
+
 Install Isaac Sim 5.1 first ([instructions](https://isaac-sim.github.io/IsaacLab/v2.3.2/source/setup/installation/index.html)),
 then:
 

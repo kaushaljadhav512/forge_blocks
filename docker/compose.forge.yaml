@@ -1,0 +1,13 @@
+# Adds this repo to Isaac Lab's own v2.3.2 base service. Used by docker/run.sh.
+services:
+  isaac-lab-base:
+    image: forge-isaaclab  # built by docker/run.sh build from Dockerfile.forge
+    working_dir: /workspace/forge_blocks
+    environment:
+      - PYTHONPATH=/workspace/forge_blocks
+    volumes:
+      # Checkpoints and results land in this folder on the host (logs/, results/, exports/), so
+      # removing containers or Docker volumes can't delete them.
+      - type: bind
+        source: ${FORGE_REPO:?set by docker/run.sh}
+        target: /workspace/forge_blocks
