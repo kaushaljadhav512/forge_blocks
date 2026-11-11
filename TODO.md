@@ -13,13 +13,20 @@ and only needs to stay untouched.
 - [x] Image `forge-isaaclab` built, with the install fixes in `docker/Dockerfile.forge`
 - [x] NVIDIA Isaac Sim license accepted
 
-Isaac Sim has not been started yet, so expect some fixes in the steps below.
+## First run (done 2026-11-03)
 
-## Next: first run
+All steps below passed. Peg8mm, 3 seeds × 1000 episodes per band, 7.5 N threshold: success
+98.3% (0-1 mm), 96.6% (1-2.5 mm), 85.5% (2.5-5 mm) averaged over seeds; median time to insert
+2.0-2.6 s; mean peak smoothed force about 10 N. About 1h45m per 200-epoch seed. Per-seed numbers
+are in `results/*.summary.json` on the PC. `sim_bridge_test.py` first failed on actions because it
+compared envs that had just been reset; fixed, then PASS (diffs < 1e-6). v3 confirmed unchanged and
+the baseline deleted on 2026-11-11.
+
+## First-run steps
 
 Run these on the PC from `~/forge/forge_blocks`. Stop and fix anything that fails before moving on.
 
-1. [ ] **Get a shell that has Docker access.** Tmux sessions started before Docker was installed don't
+1. [x] **Get a shell that has Docker access.** Tmux sessions started before Docker was installed don't
    have it, and teammates share that server, so don't kill it. Use a fresh login and a separate server:
 
    ```bash
@@ -27,26 +34,26 @@ Run these on the PC from `~/forge/forge_blocks`. Stop and fix anything that fail
    cd ~/forge/forge_blocks
    ```
 
-2. [ ] **Check the GPU is free,** and tell teammates before starting long runs:
+2. [x] **Check the GPU is free,** and tell teammates before starting long runs:
 
    ```bash
    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
    ```
 
-3. [ ] **Upstream test, 2 epochs.** Shows whether Isaac Sim works in the container, separately from this
+3. [x] **Upstream test, 2 epochs.** Shows whether Isaac Sim works in the container, separately from this
    repo's code. Also downloads the assets.
 
    ```bash
    docker/run.sh '$ISAACLAB_PATH/isaaclab.sh -p $ISAACLAB_PATH/scripts/reinforcement_learning/rl_games/train.py --task Isaac-Forge-PegInsert-Direct-v0 --headless agent.params.config.name=upstream_smoke agent.params.config.full_experiment_name=seed0 agent.params.config.max_epochs=2'
    ```
 
-4. [ ] **Preflight.** Must print `ALL PASSED`. Also prints the real time per epoch.
+4. [x] **Preflight.** Must print `ALL PASSED`. Also prints the real time per epoch.
 
    ```bash
    docker/run.sh '$ISAACLAB_PATH/isaaclab.sh -p scripts/preflight.py --headless'
    ```
 
-5. [ ] **End-to-end smoke test on the peg, 2 epochs.** `sim_bridge_test.py` must report PASS.
+5. [x] **End-to-end smoke test on the peg, 2 epochs.** `sim_bridge_test.py` must report PASS.
 
    ```bash
    docker/run.sh 'scripts/train_seeds.sh Isaac-ForgeBlocks-Peg8mm-Direct-v0 peg_smoke "0" agent.params.config.max_epochs=2'
@@ -55,21 +62,21 @@ Run these on the PC from `~/forge/forge_blocks`. Stop and fix anything that fail
    docker/run.sh '$ISAACLAB_PATH/isaaclab.sh -p scripts/sim_bridge_test.py --task Isaac-ForgeBlocks-Peg8mm-Direct-v0 --export exports/peg_smoke --headless'
    ```
 
-6. [ ] **Full training, seed 0.** About 1.5-3 hours (estimate; use the time from preflight).
+6. [x] **Full training, seed 0.** About 1.5-3 hours (estimate; use the time from preflight).
 
    ```bash
    docker/run.sh 'scripts/train_seeds.sh Isaac-ForgeBlocks-Peg8mm-Direct-v0 peg_forge "0"'
    ```
 
-7. [ ] **Evaluate.** Success should fall as error grows, especially above 2.5 mm, with forces near 7.5 N.
+7. [x] **Evaluate.** Success should fall as error grows, especially above 2.5 mm, with forces near 7.5 N.
 
    ```bash
-   docker/run.sh '$ISAACLAB_PATH/isaaclab.sh -p scripts/eval_sweep.py --task Isaac-ForgeBlocks-Peg8mm-Direct-v0 --headless --paper_bins --checkpoint logs/rl_games/peg_forge/seed0/nn/last_peg_forge_ep_200_rew_*.pth --out results/peg_forge_seed0.csv'
+   docker/run.sh '$ISAACLAB_PATH/isaaclab.sh -p scripts/eval_sweep.py --task Isaac-ForgeBlocks-Peg8mm-Direct-v0 --headless --paper_bins --checkpoint logs/rl_games/peg_forge/seed0/nn/last_peg_forge_ep_200_rew_[0-9-]*.pth --out results/peg_forge_seed0.csv'
    ```
 
-8. [ ] **Seeds 1 and 2,** if you want them (another 3-6 hours): rerun step 6 with `"1 2"`, then step 7.
+8. [x] **Seeds 1 and 2,** if you want them (another 3-6 hours): rerun step 6 with `"1 2"`, then step 7.
 
-9. [ ] **Confirm v3 is unchanged.** No diff output means it matches. Delete the baseline afterwards.
+9. [x] **Confirm v3 is unchanged.** No diff output means it matches. Delete the baseline afterwards.
 
    ```bash
    diff <(tail -n +2 ~/forge/v3_baseline.txt) <({ git -C ~/IsaacLab rev-parse HEAD; git -C ~/IsaacLab status --short; VIRTUAL_ENV=~/IsaacLab/.venv ~/.local/bin/uv pip freeze; } 2>/dev/null)

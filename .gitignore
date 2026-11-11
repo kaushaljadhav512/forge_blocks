@@ -3,6 +3,7 @@ logs/
 outputs/
 runs/
 results/
+videos/
 *.pth
 # Exported policies go through GitHub Releases or scp, not git
 exports/

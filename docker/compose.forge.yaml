@@ -5,6 +5,8 @@ services:
     working_dir: /workspace/forge_blocks
     environment:
       - PYTHONPATH=/workspace/forge_blocks
+      # Isaac Sim exits without flushing, which loses prints when output goes to a file.
+      - PYTHONUNBUFFERED=1
     volumes:
       # Checkpoints and results land in this folder on the host (logs/, results/, exports/), so
       # removing containers or Docker volumes can't delete them.
