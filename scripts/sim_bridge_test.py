@@ -110,13 +110,15 @@ def main():
         captured.clear()
         obs_dict, _, terminated, truncated, _ = env.step(torch.clamp(mus, -1.0, 1.0))
 
+        done = terminated | truncated
         for i, (pos, quat) in enumerate(targets):
-            worst["actions"] = max(worst["actions"], float(np.abs(runners[i].actions - np_(u.actions, i)).max()))
+            # env.step has already reset finished envs, so u.actions belongs to the next episode.
+            if not done[i]:
+                worst["actions"] = max(worst["actions"], float(np.abs(runners[i].actions - np_(u.actions, i)).max()))
             worst["target_pos"] = max(worst["target_pos"], float(np.abs(pos - np_(captured["pos"], i)).max()))
             dot = abs(float(np.dot(quat, np_(captured["quat"], i))))
             worst["target_quat"] = max(worst["target_quat"], 1.0 - min(dot, 1.0))
 
-        done = (terminated | truncated)
         if done.any():
             successes.append(u.ep_succeeded.float().mean().item())
             episodes += 1
