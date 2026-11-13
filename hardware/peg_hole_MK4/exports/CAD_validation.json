@@ -1,0 +1,98 @@
+{
+  "units": "mm",
+  "cadquery_version": "2.7.0",
+  "physical_prints_verified": false,
+  "notes": "CAD checks only. Select bore using actual coupon measurements; custom bore exports also require verification.",
+  "parts": {
+    "peg_D7p98_L50": {
+      "valid_solid": true,
+      "solid_count": 1,
+      "bounding_box_mm": [
+        7.98,
+        7.98,
+        50.0
+      ],
+      "volume_mm3": 2494.717782264631,
+      "stl_closed_manifold": true,
+      "stl_consistent_winding": true,
+      "stl_triangles": 3020,
+      "stl_volume_mm3": 2494.4517480097516,
+      "step_roundtrip_valid": true
+    },
+    "clearance_coupon_PRINT_FIRST": {
+      "valid_solid": true,
+      "solid_count": 1,
+      "bounding_box_mm": [
+        80.0000002,
+        28.0000002,
+        10.0000001
+      ],
+      "volume_mm3": 20526.45049327972,
+      "stl_closed_manifold": true,
+      "stl_consistent_winding": true,
+      "stl_triangles": 57704,
+      "stl_volume_mm3": 20526.676465676646,
+      "step_roundtrip_valid": true
+    },
+    "base_CAD_bore_9_UNCALIBRATED": {
+      "valid_solid": true,
+      "solid_count": 1,
+      "bounding_box_mm": [
+        100.0,
+        100.0,
+        28.0
+      ],
+      "volume_mm3": 41840.15765949598,
+      "stl_closed_manifold": true,
+      "stl_consistent_winding": true,
+      "stl_triangles": 7100,
+      "stl_volume_mm3": 41839.97124426288,
+      "step_roundtrip_valid": true
+    },
+    "base_CAD_bore_9p1_UNCALIBRATED": {
+      "valid_solid": true,
+      "solid_count": 1,
+      "bounding_box_mm": [
+        100.0,
+        100.0,
+        28.0
+      ],
+      "volume_mm3": 41804.57912269406,
+      "stl_closed_manifold": true,
+      "stl_consistent_winding": true,
+      "stl_triangles": 7100,
+      "stl_volume_mm3": 41804.396507396006,
+      "step_roundtrip_valid": true
+    },
+    "base_CAD_bore_9p2_UNCALIBRATED": {
+      "valid_solid": true,
+      "solid_count": 1,
+      "bounding_box_mm": [
+        100.0,
+        100.0,
+        28.0
+      ],
+      "volume_mm3": 41768.60788681045,
+      "stl_closed_manifold": true,
+      "stl_consistent_winding": true,
+      "stl_triangles": 7100,
+      "stl_volume_mm3": 41768.42913884091,
+      "step_roundtrip_valid": true
+    },
+    "base_CAD_bore_9p3_UNCALIBRATED": {
+      "valid_solid": true,
+      "solid_count": 1,
+      "bounding_box_mm": [
+        100.0,
+        100.0,
+        28.0
+      ],
+      "volume_mm3": 41732.24395184516,
+      "stl_closed_manifold": true,
+      "stl_consistent_winding": true,
+      "stl_triangles": 7100,
+      "stl_volume_mm3": 41732.06911263865,
+      "step_roundtrip_valid": true
+    }
+  }
+}

@@ -6,7 +6,7 @@ results/
 videos/
 *.pth
 # Exported policies go through GitHub Releases or scp, not git
-exports/
+/exports/
 
 __pycache__/
 *.py[cod]
