@@ -37,6 +37,8 @@ parser.add_argument("--force_scale", type=float, default=1.0, help="multiply the
 parser.add_argument("--force_bias_N", type=float, default=0.0, help="constant force offset, random direction per episode")
 parser.add_argument("--action_delay", type=int, default=0, help="apply each action this many policy steps late")
 parser.add_argument("--gain_scale", type=float, default=1.0, help="multiply the controller stiffness (before its noise)")
+parser.add_argument("--force_deadband_N", type=float, default=0.0, help="observed force shrinks by this; smaller reads 0")
+parser.add_argument("--force_deadband_mode", choices=["axis", "norm"], default="axis")
 parser.add_argument("--out", required=True, help="per-episode CSV; a .summary.json is written next to it")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -139,6 +141,8 @@ def main():
 
     env_cfg.obs_rand.ft_force_scale = args_cli.force_scale
     env_cfg.obs_rand.ft_force_bias_N = args_cli.force_bias_N
+    env_cfg.obs_rand.ft_force_deadband_N = args_cli.force_deadband_N
+    env_cfg.obs_rand.ft_force_deadband_mode = args_cli.force_deadband_mode
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
@@ -220,7 +224,11 @@ def main():
         writer.writerows(rows)
     summary_path = os.path.splitext(args_cli.out)[0] + ".summary.json"
     with open(summary_path, "w") as f:
-        stress = {k: getattr(args_cli, k) for k in ("force_scale", "force_bias_N", "action_delay", "gain_scale")}
+        stress = {
+            k: getattr(args_cli, k)
+            for k in ("force_scale", "force_bias_N", "action_delay", "gain_scale", "force_deadband_N", "force_deadband_mode")
+        }
+        stress["force_threshold"] = args_cli.force_threshold
         json.dump(
             {
                 "task": args_cli.task,

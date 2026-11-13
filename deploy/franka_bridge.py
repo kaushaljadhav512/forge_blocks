@@ -516,25 +516,44 @@ def press_test(arm, cfg: BridgeConfig, descend_m_s=0.005, max_descent=0.06, stop
     return {"raw_mean_force": np.mean(pressed, axis=0).tolist(), "raw_fz": fz, "force_sign": sign}
 
 
-def rate_test(arm, cfg: BridgeConfig, seconds=5.0, runner: ForgePolicyRunner | None = None):
-    """Hold the current pose while streaming it back at cfg.control_hz. Reports the achieved send rate,
-    how often the robot state actually changes, and the policy's inference time. No motion."""
+def rate_test(arm, cfg: BridgeConfig, seconds=5.0, runner: ForgePolicyRunner | None = None, step_m=0.002,
+              clock=time.monotonic, sleep=time.sleep):
+    """Hold the current pose while streaming it back at cfg.control_hz, then step the target
+    step_m straight UP. Reports the achieved send rate, how often the robot state actually changes,
+    the delay from the step command to the first 0.3 mm of motion and to 63% of the step (the sim
+    loses 10-15 points with one 67 ms policy step of delay), and the policy's inference time."""
     st = arm.read()
-    arm.start_stream(st.tool_pos, st.tool_R, cfg.stiffness, max_duration=seconds + 5)
-    sends, changes, last_q = 0, 0, None
-    t0 = time.monotonic()
+    hold_pos, R = st.tool_pos.copy(), st.tool_R.copy()
+    arm.start_stream(hold_pos, R, cfg.stiffness, max_duration=seconds + 10)
+    sends, changes, last_q, last_f = 0, 0, None, None
+    t0 = clock()
+    out = {}
     try:
-        while time.monotonic() - t0 < seconds:
+        while clock() - t0 < seconds:
             s = arm.read()
             if last_q is None or not np.array_equal(s.q, last_q) or not np.array_equal(s.force, last_f):
                 changes += 1
             last_q, last_f = s.q, s.force
-            arm.send_target(st.tool_pos, st.tool_R)
+            arm.send_target(hold_pos, R)
             sends += 1
-            time.sleep(max(0.0, 1.0 / cfg.control_hz - 1e-4))
+            sleep(max(0.0, 1.0 / cfg.control_hz - 1e-4))
+        out = {"send_hz": sends / seconds, "state_update_hz": changes / seconds}
+
+        z0 = arm.read().tool_pos[2]
+        up = hold_pos + np.array([0.0, 0.0, step_m])
+        t_step, first, rise = clock(), None, None
+        while clock() - t_step < 2.0 and rise is None:
+            arm.send_target(up, R)
+            dz = arm.read().tool_pos[2] - z0
+            if first is None and dz > 0.0003:
+                first = clock() - t_step
+            if dz > 0.63 * step_m:
+                rise = clock() - t_step
+            sleep(1.0 / cfg.control_hz)
+        out["step_first_motion_ms"] = None if first is None else 1000 * first
+        out["step_63pct_ms"] = None if rise is None else 1000 * rise
     finally:
         arm.stop_stream()
-    out = {"send_hz": sends / seconds, "state_update_hz": changes / seconds}
     if runner is not None and runner.policy is not None:
         tip, quat, _ = tip_pose(st, cfg)
         runner.reset(tip, quat, tip - np.array([0.0, 0.0, START_ABOVE_RIM]))
@@ -546,3 +565,54 @@ def rate_test(arm, cfg: BridgeConfig, seconds=5.0, runner: ForgePolicyRunner | N
         out["policy_ms_median"] = 1000 * float(np.median(times))
         out["policy_ms_max"] = 1000 * float(np.max(times))
     return out
+
+
+def force_curve(arm, cfg: BridgeConfig, descend_m_s=0.004, max_descent=0.08, stall_m=0.003, max_cmd_N=15.0,
+                bins_N=1.0, clock=time.monotonic, sleep=time.sleep):
+    """Measure how the force estimate responds to small forces (the TA's "below ~5 N" effect).
+
+    Lowers the held peg onto a free flat surface at constant speed. Contact is detected from
+    position (the target keeps descending, the fingertip stops), not from the force reading, so a
+    dead band can't hide it. After contact the push grows slowly; the commanded push is
+    stiffness_z * (fingertip - target) (minus whatever joint friction eats). Records the estimate's
+    z against it up to max_cmd_N, then lifts back to the start.
+
+    Returns the raw samples and a table: commanded push bin -> mean |estimate z| (tared).
+    A clean sensor follows the commanded line; a dead band reads ~0 up to its width.
+    """
+    k = cfg.stiffness[2]
+    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
+    st = arm.read()
+    start_tool, R = st.tool_pos.copy(), st.tool_R.copy()
+    start_tip = tool_to_tip(start_tool, R, cfg.tip_offset)
+    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=max_descent / descend_m_s + 10)
+    t0, samples, contact_t = clock(), [], None
+    try:
+        while True:
+            t = clock() - t0
+            depth = descend_m_s * t
+            if depth > max_descent:
+                raise HardwareError("no contact within the descent limit; is there a surface below?")
+            target_tip = start_tip - np.array([0.0, 0.0, depth])
+            st = arm.read()
+            tip = tool_to_tip(st.tool_pos, st.tool_R, cfg.tip_offset)
+            lag = tip[2] - target_tip[2]
+            cmd = k * max(lag, 0.0)
+            measured = st.force - tare
+            if contact_t is None and lag > stall_m:
+                contact_t = t
+            samples.append({"t": t, "lag_m": lag, "cmd_N": cmd, "force": measured.tolist(), "contact": contact_t is not None})
+            if cmd > max_cmd_N:
+                break
+            arm.send_target(tip_to_tool(target_tip, R, cfg.tip_offset), R)
+            sleep(1.0 / cfg.control_hz)
+    finally:
+        arm.stop_stream()
+        arm.goto(start_tool, R, 3.0)
+    table = []
+    for lo in np.arange(0.0, max_cmd_N, bins_N):
+        sel = [abs(s["force"][2]) for s in samples if s["contact"] and lo <= s["cmd_N"] < lo + bins_N]
+        if sel:
+            table.append({"cmd_N": float(lo + bins_N / 2), "mean_abs_fz_N": float(np.mean(sel)), "n": len(sel)})
+    free = [s["force"] for s in samples if not s["contact"]]
+    return {"samples": samples, "table": table, "free_space_std_N": np.std(free, axis=0).tolist() if free else None}

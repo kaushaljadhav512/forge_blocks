@@ -43,6 +43,8 @@ class BlockObsRandCfg(ForgeObsRandCfg):
     # 1.0 / 0.0 for training: the exported runner_config.json records them.
     ft_force_scale: float = 1.0
     ft_force_bias_N: float = 0.0
+    ft_force_deadband_N: float = 0.0
+    ft_force_deadband_mode: str = "axis"
 
 
 @configclass

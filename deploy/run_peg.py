@@ -2,9 +2,10 @@
 """Peg insertion on the real Franka. Order of use (deploy/README.md, Phases 3-5):
 
     run_peg.py check                                   read-only: state, frames, force, gripper
-    run_peg.py rate-test --export EXPORT --ack-safety  holds pose; measures stream/state rates, policy time
+    run_peg.py rate-test --export EXPORT --ack-safety  holds pose, then 2 mm up step: rates, latency, policy time
     run_peg.py grasp --ack-safety                      close on the peg (finger ends on the 32 mm line)
     run_peg.py press-test --ack-safety                 peg pressed on a free surface -> force_sign
+    run_peg.py force-curve --ack-safety                force estimate vs commanded push, 0-15 N
     run_peg.py register-hole --ack-safety              hand-guide into the hole 5x -> hole.json
     run_peg.py shadow --export EXPORT                  guide mode; policy runs but commands nothing
     run_peg.py run --export EXPORT --air --trials 1 --ack-safety          estimate 10 cm high: no contact
@@ -90,6 +91,7 @@ def main(argv=None):
     add("grasp", moves=True)
     add("open", moves=True)
     add("press-test", moves=True)
+    add("force-curve", moves=True)
     a = add("register-hole", moves=True)
     a.add_argument("--n", type=int, default=5)
     a = add("shadow", export=True)
@@ -151,6 +153,20 @@ def main(argv=None):
         save_calib(args.dir, force_sign=out["force_sign"], press_test=out)
         log_event(args.dir / "events.jsonl", event="press_test", **out)
         print(f"force_sign = {out['force_sign']:+.0f} saved")
+        return 0
+
+    if args.cmd == "force-curve":
+        confirm("Peg grasped, 1-5 cm above a FREE flat surface (not the hole), nothing else below?")
+        out = fb.force_curve(arm, cfg)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = args.dir / f"force_curve_{stamp}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(out))
+        print("commanded push (N) -> mean |estimate z| (N):")
+        for row in out["table"]:
+            print(f"  {row['cmd_N']:5.1f} -> {row['mean_abs_fz_N']:5.2f}   (n={row['n']})")
+        print("free-space std (N):", np.round(out["free_space_std_N"], 2).tolist() if out["free_space_std_N"] else None)
+        print("saved", path)
         return 0
 
     if args.cmd == "register-hole":

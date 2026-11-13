@@ -61,3 +61,17 @@ def sample_radius_error(n: int, radius_range, mode: str, device="cpu") -> torch.
         direction = torch.stack((torch.cos(theta), torch.sin(theta), torch.zeros_like(theta)), dim=1)
         return radius * direction
     raise ValueError(f"unknown error mode {mode!r}; expected 'xy' or 'xyz'")
+
+
+def force_deadband(force: torch.Tensor, deadband: float, mode: str = "axis") -> torch.Tensor:
+    """Shrink the observed force toward zero by `deadband` N; anything smaller reads 0.
+
+    "axis": per component (a 4 N sideways push vanishes under a 5 N band).
+    "norm": on the magnitude, keeping the direction of what is left.
+    """
+    if mode == "axis":
+        return torch.sign(force) * (force.abs() - deadband).clamp_min(0.0)
+    if mode == "norm":
+        mag = torch.linalg.norm(force, dim=-1, keepdim=True)
+        return force * (mag - deadband).clamp_min(0.0) / mag.clamp_min(1e-9)
+    raise ValueError(f"unknown dead-band mode {mode!r}; expected 'axis' or 'norm'")

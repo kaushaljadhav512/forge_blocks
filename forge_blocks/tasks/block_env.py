@@ -15,13 +15,18 @@
    ft_force_scale * force + bias, with |bias| = ft_force_bias_N in a random direction per episode.
    They stand in for the real Franka's force estimate: a wrong sign (scale -1), a wrong
    magnitude, or an offset left after taring.
+
+4. Force-sensing dead band (off by default). The Franka's force estimate is unreliable below about
+   5 N. With ft_force_deadband_N = d, the observed force shrinks toward zero by d and anything
+   smaller reads 0: per component ("axis", loses small sideways forces entirely) or on the
+   magnitude ("norm", keeps the direction of what's left).
 """
 
 import torch
 
 from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
 
-from forge_blocks.observation import noisy_finite_difference, sample_radius_error
+from forge_blocks.observation import force_deadband, noisy_finite_difference, sample_radius_error
 
 
 class ForgeBlocksEnv(ForgeEnv):
@@ -37,6 +42,11 @@ class ForgeBlocksEnv(ForgeEnv):
             self.noisy_force = scale * self.noisy_force
         if self._force_bias is not None:
             self.noisy_force = self.noisy_force + self._force_bias
+        deadband = getattr(self.cfg.obs_rand, "ft_force_deadband_N", 0.0)
+        if deadband > 0.0:
+            self.noisy_force = force_deadband(
+                self.noisy_force, deadband, getattr(self.cfg.obs_rand, "ft_force_deadband_mode", "axis")
+            )
 
         if self._prev_noisy_pos is None:
             self._remember_noisy_pose()

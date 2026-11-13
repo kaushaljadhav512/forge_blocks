@@ -106,15 +106,30 @@ on a board.
   | Force sign flipped (`--force_scale -1`) | 34.0% | 30.7% | 25.0% |
   | Force offset 1 N, random direction | 96.5% | 95.4% | 85.0% |
   | Force offset 2 N | 87.0% | 83.5% | 70.6% |
-  | Force offset 4 N | 34.7% | pending | pending |
-  | One policy step of action delay | pending | | |
-  | Stiffness × 0.7 | pending | | |
-  | Stiffness × 1.3 | pending | | |
+  | Force offset 4 N | 34.7% | 35.9% | 27.6% |
+  | One policy step (67 ms) of action delay | 86.1% | 83.8% | 75.0% |
+  | Stiffness × 0.7 | 96.9% | 94.6% | 85.9% |
+  | Stiffness × 1.3 | 98.6% | 97.1% | 91.0% |
+  | Force dead band 2.5 N, per axis (`--force_deadband_N 2.5`) | 91.5% | 89.3% | 79.4% |
+  | Force dead band 5 N, per axis | 78.2% | 74.0% | 61.5% |
+  | Force dead band 5 N, on the magnitude (`--force_deadband_mode norm`) | 86.2% | 80.5% | 68.8% |
+  | Contact threshold 10 N instead of 7.5 (`--force_threshold 10`) | 97.8% | 96.9% | 90.9% |
+  | Dead band 5 N per axis + threshold 10 N | 76.5% | 70.7% | 59.7% |
 
   **Force offset is the biggest risk.** 1 N costs a few points, 2 N costs 10–20, and 4 N is as bad as
   a flipped sign. The tare before each attempt has to leave well under 1 N, and the robot's force
   estimate must not drift by more than that during the 2–10 s attempt. If it does, retrain with a
   random per-episode force offset (an `obs_rand` option like the stress test, but during training).
+
+  **Stiffness mismatch is harmless; latency is not.** ±30% stiffness moves success by under 5 points.
+  One step of delay costs 10–15, so the bridge must send each action within the same 15 Hz tick
+  (`rate-test` measures the real step latency).
+
+  **Weak-force dead band.** Franka's external-force estimate is unreliable below about 5 N (from the
+  course TA). Modelled as an observed force that reads zero below the band and is shrunk by the band
+  above it: a 5 N dead band costs 20–30 points, 2.5 N costs 6–11. Raising the contact threshold to
+  10 N doesn't win it back. Measure the real curve with `run_peg.py force-curve`; if it shows a dead
+  band of more than ~2 N, retrain with a random dead band (0–5 N) plus a random force offset.
 
 ### Phase 1: hardware
 
@@ -165,12 +180,15 @@ E-stop operator. State (`calibration.json`, `hole.json`, logs) goes to `deploy/r
    FrankaPy provides a Jacobian.
 2. `rate-test --export exports/peg_forge_seed2`: holds the current pose while streaming it back.
    Reports the achieved stream rate, how often the robot state really updates, and the policy's
-   inference time. If the stream rate is well below 120 Hz, lower `--control_hz` and tell me, so
+   inference time. Then it steps the target 2 mm up and reports the time to first motion and to 63%
+   of the step (sim budget: well under one 67 ms policy step). If the stream rate is well below 120 Hz, lower `--control_hz` and tell me, so
    the effect can be measured in sim.
 3. `grasp`: closes on the peg (40 N) with the finger ends on the 32 mm line.
 4. `press-test`: lowers the held peg onto a **free flat surface** (not the hole) until the force
    builds up, and saves `force_sign` so that pressing reads +z, as in sim. Use the robot for this,
    not your hand: a hand pushing down on the gripper is a force in the opposite direction.
+   Then `force-curve`: pushes the peg into the surface in steps and prints commanded push vs measured
+   |fz|, plus the free-space noise. This shows how big the dead band below ~5 N really is.
 5. `register-hole`: guide mode, 5 times: seat the peg fully by hand and hold it still. Saves the
    seated fingertip pose; the rim centre is 7.1 mm below it (32.1 mm grasp − 25 mm depth). The spread
    should be under 0.5 mm.
@@ -217,7 +235,8 @@ bands, then `summary`:
 | Force offset or wrong sign | Robot press test; tare before each attempt; offsets above 1 N cost a lot (stress table); retrain with random offsets if the real estimate drifts |
 | Peg slipping in the grasp | 40 N grasp; the safety floor catches a peg pushed up in the fingers |
 | Real impedance controller ≠ sim controller (the sim also cancels inertia and has a dead zone) | Stiffness stress evals; the sim already randomizes stiffness by ±41% |
-| Stream or state rate too low | `rate-test`; then measure the effect in sim |
+| Stream or state rate too low | `rate-test` (rates and 2 mm step latency); one 67 ms step of delay costs 10–15 points in sim |
+| Force estimate dead below ~5 N | `force-curve` measures it; a 5 N dead band costs 20–30 points in sim; retrain with a random dead band if needed |
 | Policy file won't load on the lab computer | Check the torch version first; re-export |
 | Error in the hole registration | Repeat the hand-guided registration 5 times |
 | Printed parts off-size | Clearance coupon (`../hardware/README.md`); measure and report the actual clearance |

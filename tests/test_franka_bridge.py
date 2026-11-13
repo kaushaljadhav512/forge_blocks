@@ -23,12 +23,13 @@ RIM = np.array([0.59, 0.0, 0.028])
 
 
 class FakeArm:
-    def __init__(self, raw_sign=1.0, bias=(0.0, 0.0, 0.0), tau=0.1, R=fb.DOWN, spike_at=None):
+    def __init__(self, raw_sign=1.0, bias=(0.0, 0.0, 0.0), tau=0.1, R=fb.DOWN, spike_at=None, sense_deadband=0.0):
         self.t = 0.0
         self.tip = RIM + np.array([0.0, 0.0, fb.START_ABOVE_RIM])
         self.R = np.array(R, dtype=float)
         self.target = None
         self.raw_sign, self.bias, self.tau, self.spike_at = raw_sign, np.array(bias), tau, spike_at
+        self.sense_deadband = sense_deadband
         self.streaming, self.sent, self.streams = False, 0, 0
 
     # virtual time
@@ -57,7 +58,9 @@ class FakeArm:
         return np.array([0.0, 0.0, 565.0 * max(0.0, self.tip[2] - self.target[2])])  # surface pushes up
 
     def read(self):
-        f = self.raw_sign * self.env_force() + self.bias
+        f = self.env_force()
+        f = np.sign(f) * np.clip(np.abs(f) - self.sense_deadband, 0.0, None)  # unreliable small forces
+        f = self.raw_sign * f + self.bias
         if self.spike_at is not None and self.t > self.spike_at:
             f = f + np.array([0.0, 0.0, 100.0])
         return fb.RobotState(t=self.t, q=np.zeros(7), dq=np.zeros(7), tool_pos=fb.tip_to_tool(self.tip, self.R),
@@ -195,6 +198,24 @@ class TestCalibration(unittest.TestCase):
             out = fb.press_test(arm, fb.BridgeConfig(tare_s=0.05), descend_m_s=0.02, clock=arm.clock, sleep=arm.sleep)
             self.assertEqual(out["force_sign"], raw_sign)
             self.assertFalse(arm.streaming)
+
+    def test_force_curve_shows_deadband(self):
+        for band in (0.0, 5.0):
+            arm = FakeArm(sense_deadband=band, bias=(0.3, 0.0, -2.0))
+            arm.tip = RIM + [0.03, 0.0, fb.GRASP_TIP_ABOVE_PEG_BOTTOM + 0.01]
+            out = fb.force_curve(arm, fb.BridgeConfig(tare_s=0.05), descend_m_s=0.02, clock=arm.clock, sleep=arm.sleep)
+            self.assertFalse(arm.streaming)
+            table = {round(r["cmd_N"] - 0.5): r["mean_abs_fz_N"] for r in out["table"]}
+            self.assertAlmostEqual(table[10], max(10.5 - band, 0.0), delta=0.6)
+            self.assertAlmostEqual(table[2], max(2.5 - band, 0.0), delta=0.6)
+
+    def test_rate_test_reports_step_latency(self):
+        arm = FakeArm(tau=0.05)
+        out = fb.rate_test(arm, fb.BridgeConfig(), seconds=0.5, clock=arm.clock, sleep=arm.sleep)
+        self.assertGreater(out["send_hz"], 150)
+        self.assertLess(out["step_first_motion_ms"], 20)
+        self.assertAlmostEqual(out["step_63pct_ms"], 50, delta=15)  # first-order lag with tau = 50 ms
+        self.assertFalse(arm.streaming)
 
     def test_samplers(self):
         rng = np.random.default_rng(1)

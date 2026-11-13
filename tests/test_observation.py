@@ -175,5 +175,20 @@ class TestSampleRadiusError(unittest.TestCase):
             self.sample(1, [0.0, 0.01], "z")
 
 
+@unittest.skipIf(torch is None, "needs torch")
+class TestForceDeadband(unittest.TestCase):
+    def test_axis(self):
+        from forge_blocks.observation import force_deadband
+
+        f = torch.tensor([[4.0, -7.0, 12.0]])
+        torch.testing.assert_close(force_deadband(f, 5.0, "axis"), torch.tensor([[0.0, -2.0, 7.0]]))
+
+    def test_norm_keeps_direction(self):
+        from forge_blocks.observation import force_deadband
+
+        f = torch.tensor([[6.0, 0.0, 8.0], [3.0, 0.0, 4.0]])  # |f| = 10 and 5
+        torch.testing.assert_close(force_deadband(f, 5.0, "norm"), torch.tensor([[3.0, 0.0, 4.0], [0.0, 0.0, 0.0]]))
+
+
 if __name__ == "__main__":
     unittest.main()
