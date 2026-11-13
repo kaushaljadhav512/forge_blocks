@@ -7,7 +7,8 @@ Each env gets its own ForgePolicyRunner fed only quantities a real robot can pro
 pose, velocities, contact force, the *estimated* slot position). Every step we compare:
   * the runner's observation vs the env's policy observation,
   * the runner's EMA-smoothed actions vs env.actions,
-  * the runner's pose target vs the target ForgeEnv sends to its controller (first substep).
+  * the runner's pose target vs the target ForgeEnv sends to its controller, on every physics
+    substep (runner.target() with that substep's fingertip pose, as the robot bridge will do).
 Any mismatch is a frame/ordering/normaliser bug that would otherwise show up on the robot.
 """
 
@@ -58,14 +59,35 @@ def main():
         r = ForgePolicyRunner(copy.deepcopy(template.cfg), template.policy)
         runners.append(r)
 
-    # Record the first controller target ForgeEnv computes in each policy step.
-    captured = {}
+    worst = {"obs": 0.0, "actions": 0.0, "target_pos": 0.0, "target_quat": 0.0, "substeps_checked": 0}
     original = u.generate_ctrl_signals
+    original_apply = u._apply_action
+    in_apply = [False]
+
+    def apply_action():
+        # Reset code (gripper closing, IK moves) also calls generate_ctrl_signals; check only the
+        # policy-driven calls, i.e. those from _apply_action inside env.step's decimation loop.
+        in_apply[0] = True
+        try:
+            original_apply()
+        finally:
+            in_apply[0] = False
+
+    u._apply_action = apply_action
 
     def capture(ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, **kw):
-        if "pos" not in captured:
-            captured["pos"] = ctrl_target_fingertip_midpoint_pos.clone()
-            captured["quat"] = ctrl_target_fingertip_midpoint_quat.clone()
+        if not in_apply[0]:
+            return original(ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, **kw)
+        # Every physics substep: the runner's target from this substep's pose must match ForgeEnv's.
+        # (Resets run after the decimation loop, so every substep here belongs to the running episode.)
+        for i, r in enumerate(runners):
+            pos, quat = r.target(np_(u.fingertip_midpoint_pos, i), np_(u.fingertip_midpoint_quat, i))
+            worst["target_pos"] = max(
+                worst["target_pos"], float(np.abs(pos - np_(ctrl_target_fingertip_midpoint_pos, i)).max())
+            )
+            dot = abs(float(np.dot(quat, np_(ctrl_target_fingertip_midpoint_quat, i))))
+            worst["target_quat"] = max(worst["target_quat"], 1.0 - min(dot, 1.0))
+        worst["substeps_checked"] += 1
         return original(ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, **kw)
 
     u.generate_ctrl_signals = capture
@@ -87,13 +109,11 @@ def main():
 
     obs_dict, _ = env.reset()
     reset_runners()
-    worst = {"obs": 0.0, "actions": 0.0, "target_pos": 0.0, "target_quat": 0.0}
     successes, episodes = [], 0
 
     while episodes < args_cli.episodes:
         env_obs = obs_dict["policy"]
         mus = torch.zeros(n, 7, device=u.device)
-        targets = []
         for i, r in enumerate(runners):
             obs = r.build_obs(
                 np_(u.noisy_fingertip_pos, i),
@@ -105,19 +125,15 @@ def main():
             worst["obs"] = max(worst["obs"], float(np.abs(obs - np_(env_obs, i)).max()))
             mu = r._run_policy(obs)
             mus[i] = torch.as_tensor(mu, device=u.device)
-            targets.append(r.apply_action(mu, np_(u.fingertip_midpoint_pos, i), np_(u.fingertip_midpoint_quat, i)))
+            r.update_actions(mu)
 
-        captured.clear()
         obs_dict, _, terminated, truncated, _ = env.step(torch.clamp(mus, -1.0, 1.0))
 
         done = terminated | truncated
-        for i, (pos, quat) in enumerate(targets):
+        for i, r in enumerate(runners):
             # env.step has already reset finished envs, so u.actions belongs to the next episode.
             if not done[i]:
-                worst["actions"] = max(worst["actions"], float(np.abs(runners[i].actions - np_(u.actions, i)).max()))
-            worst["target_pos"] = max(worst["target_pos"], float(np.abs(pos - np_(captured["pos"], i)).max()))
-            dot = abs(float(np.dot(quat, np_(captured["quat"], i))))
-            worst["target_quat"] = max(worst["target_quat"], 1.0 - min(dot, 1.0))
+                worst["actions"] = max(worst["actions"], float(np.abs(r.actions - np_(u.actions, i)).max()))
 
         if done.any():
             successes.append(u.ep_succeeded.float().mean().item())
@@ -125,7 +141,7 @@ def main():
             reset_runners()
             print(f"[bridge] episode {episodes}: success {successes[-1]:.2f}, worst diffs so far {worst}")
 
-    ok = all(v <= args_cli.atol for v in worst.values())
+    ok = worst["substeps_checked"] > 0 and all(v <= args_cli.atol for k, v in worst.items() if k != "substeps_checked")
     print(f"[bridge] {'PASS' if ok else 'FAIL'}  worst diffs: {worst}  success: {np.mean(successes):.3f}")
     env.close()
     if not ok:

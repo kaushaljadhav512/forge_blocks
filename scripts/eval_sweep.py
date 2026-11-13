@@ -32,6 +32,11 @@ parser.add_argument("--num_envs", type=int, default=128)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--force_threshold", type=float, default=7.5, help="N; the paper deploys at 7.5")
 parser.add_argument("--pred_threshold", type=float, default=0.5, help="success-prediction cut-off")
+# Stress tests for the gap to the real robot (defaults leave the sim unchanged).
+parser.add_argument("--force_scale", type=float, default=1.0, help="multiply the observed force (-1: wrong sign)")
+parser.add_argument("--force_bias_N", type=float, default=0.0, help="constant force offset, random direction per episode")
+parser.add_argument("--action_delay", type=int, default=0, help="apply each action this many policy steps late")
+parser.add_argument("--gain_scale", type=float, default=1.0, help="multiply the controller stiffness (before its noise)")
 parser.add_argument("--out", required=True, help="per-episode CSV; a .summary.json is written next to it")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -92,10 +97,15 @@ def run_episode(env, wrapped, player, obs):
     first_pred = torch.full((n,), -1, dtype=torch.long, device=u.device)
     if player.is_rnn:
         player.init_rnn()
+    # --action_delay: until the delayed actions arrive, send the reset actions, which hold the pose.
+    queue = [u.actions.clone() for _ in range(args_cli.action_delay)]
     t = 0
     while True:
         with torch.inference_mode():
             actions = player.get_action(player.obs_to_torch(obs), is_deterministic=True)
+            if queue:
+                queue.append(actions)
+                actions = queue.pop(0)
             obs, _, dones, _ = wrapped.step(actions)
         t += 1
         pred = (u.actions[:, 6] + 1) / 2 > args_cli.pred_threshold
@@ -127,8 +137,12 @@ def main():
         sys.exit(f"{args_cli.task} has no radius option; use an Isaac-ForgeBlocks-* task ID")
     agent_cfg = load_cfg_from_registry(args_cli.task, "rl_games_cfg_entry_point")
 
+    env_cfg.obs_rand.ft_force_scale = args_cli.force_scale
+    env_cfg.obs_rand.ft_force_bias_N = args_cli.force_bias_N
+
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
+    u.default_gains *= args_cli.gain_scale  # ForgeEnv draws each episode's gains around these
     wrapped, player = make_player(env, agent_cfg)
     step_dt = u.step_dt
 
@@ -206,7 +220,18 @@ def main():
         writer.writerows(rows)
     summary_path = os.path.splitext(args_cli.out)[0] + ".summary.json"
     with open(summary_path, "w") as f:
-        json.dump({"task": args_cli.task, "checkpoint": args_cli.checkpoint, "error_mode": mode, "levels": summary}, f, indent=2)
+        stress = {k: getattr(args_cli, k) for k in ("force_scale", "force_bias_N", "action_delay", "gain_scale")}
+        json.dump(
+            {
+                "task": args_cli.task,
+                "checkpoint": args_cli.checkpoint,
+                "error_mode": mode,
+                "stress": stress,
+                "levels": summary,
+            },
+            f,
+            indent=2,
+        )
     print(f"[eval] wrote {args_cli.out} and {summary_path}")
     env.close()
 

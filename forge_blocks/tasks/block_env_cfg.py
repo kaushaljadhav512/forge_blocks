@@ -39,6 +39,10 @@ class BlockObsRandCfg(ForgeObsRandCfg):
     # see block_env.py. A string and list rather than None so Hydra overrides keep their types.
     error_radius_mode: str = "gaussian"
     error_radius: list = [0.0, 0.0]
+    # Evaluation-only stress tests of the force observation (see block_env.py). Leave at
+    # 1.0 / 0.0 for training: the exported runner_config.json records them.
+    ft_force_scale: float = 1.0
+    ft_force_bias_N: float = 0.0
 
 
 @configclass

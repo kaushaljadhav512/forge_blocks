@@ -136,6 +136,11 @@ Copy `exports/<name>/` to the laptop or robot PC with `scp`, or attach it to a G
 - **Start pose.** Sim starts the hand within ±2 cm of the *true* slot. On the robot, start above
   the *estimated* slot.
 
+## Real robot
+
+The plan for running the peg policy on the Franka is in [deploy/README.md](deploy/README.md). The
+peg, hole and jig to make are in [hardware/README.md](hardware/README.md).
+
 ## Not yet written
 
 - The FrankaPy bridge (Phase 5): read the robot state, filter force with `ForceFilter`, call

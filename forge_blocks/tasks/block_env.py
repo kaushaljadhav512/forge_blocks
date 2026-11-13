@@ -10,7 +10,14 @@
      "gaussian"  upstream behaviour (sigma from fixed_asset_pos, the default)
      "xyz"       uniform radius, uniform direction on the sphere (the paper's evaluation)
      "xy"        uniform radius in the plane, z stays Gaussian (the project's ablation grid)
+
+3. Force-sensing stress tests (evaluation only; both off by default). The observed force becomes
+   ft_force_scale * force + bias, with |bias| = ft_force_bias_N in a random direction per episode.
+   They stand in for the real Franka's force estimate: a wrong sign (scale -1), a wrong
+   magnitude, or an offset left after taring.
 """
+
+import torch
 
 from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
 
@@ -20,9 +27,16 @@ from forge_blocks.observation import noisy_finite_difference, sample_radius_erro
 class ForgeBlocksEnv(ForgeEnv):
     _prev_noisy_pos = None
     _prev_noisy_quat = None
+    _force_bias = None
 
     def _compute_intermediate_values(self, dt):
         super()._compute_intermediate_values(dt)
+
+        scale = getattr(self.cfg.obs_rand, "ft_force_scale", 1.0)
+        if scale != 1.0:
+            self.noisy_force = scale * self.noisy_force
+        if self._force_bias is not None:
+            self.noisy_force = self.noisy_force + self._force_bias
 
         if self._prev_noisy_pos is None:
             self._remember_noisy_pose()
@@ -37,6 +51,13 @@ class ForgeBlocksEnv(ForgeEnv):
         # Factory zeroes the velocities at the end of its reset; start the history from here so the
         # first step after a reset doesn't difference across the teleport.
         self._remember_noisy_pose()
+
+        bias_n = getattr(self.cfg.obs_rand, "ft_force_bias_N", 0.0)
+        if bias_n > 0.0:
+            if self._force_bias is None:
+                self._force_bias = torch.zeros((self.num_envs, 3), device=self.device)
+            direction = torch.randn((len(env_ids), 3), device=self.device)
+            self._force_bias[env_ids] = bias_n * direction / torch.linalg.norm(direction, dim=1, keepdim=True)
 
         mode = getattr(self.cfg.obs_rand, "error_radius_mode", "gaussian")
         if mode == "gaussian":

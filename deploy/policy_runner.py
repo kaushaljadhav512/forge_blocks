@@ -9,14 +9,20 @@ ForgeEnv does around the policy (isaaclab_tasks/direct/forge/forge_env.py @ v2.3
                Compute the velocities over about 1/120 s on the robot, as forge_blocks does in
                sim, not over the 1/15 s policy step. Don't use with upstream checkpoints: their
                velocity inputs are noise (Isaac Lab issue #8874).
-  action       _pre_physics_step: EMA of the clamped policy mean
-               _apply_action:     targets relative to the estimated slot, clipped to a step
-                                  around the current fingertip pose, upright orientation
+  action       _pre_physics_step: EMA of the clamped policy mean           -> update_actions()
+               _apply_action:     targets relative to the estimated slot,   -> target()
+                                  clipped to a step around the current
+                                  fingertip pose, upright orientation
 
 All quaternions are (w, x, y, z); all vectors are in the robot base frame, which plays the
 role of the sim's world frame. "Fingertip" is Factory's fingertip midpoint (between the pads).
 
 Units: m, rad, N. Call reset() at the start of every attempt, then step() at 15 Hz.
+
+Two rates. ForgeEnv updates the actions once per policy step but recomputes the controller target
+from the *current* fingertip pose on every physics step (120 Hz), so the 2 cm step clip follows the
+hand as it moves. On the robot, call step() at 15 Hz and then target() with the latest fingertip
+pose at 120 Hz or faster until the next step(); don't hold step()'s target for the whole 1/15 s.
 """
 
 from __future__ import annotations
@@ -191,12 +197,19 @@ class ForgePolicyRunner:
             self._c = torch.zeros_like(self._h)
 
     def step(self, fingertip_pos, fingertip_quat, linvel, angvel, force_smoothed):
-        """One 15 Hz step. Returns (target_pos, target_quat, success_prob, obs)."""
+        """One 15 Hz step. Returns (target_pos, target_quat, success_prob, obs).
+
+        The returned target is for the current pose only; keep calling target() with fresh poses
+        until the next step() (see the module docstring).
+        """
         obs = self.build_obs(fingertip_pos, fingertip_quat, linvel, angvel, force_smoothed)
         mu = self._run_policy(obs)
         target_pos, target_quat = self.apply_action(mu, fingertip_pos, fingertip_quat)
-        success_prob = (self.actions[6] + 1.0) / 2.0
-        return target_pos, target_quat, success_prob, obs
+        return target_pos, target_quat, self.success_prob, obs
+
+    @property
+    def success_prob(self) -> float:
+        return (self.actions[6] + 1.0) / 2.0
 
     # .. pieces (public so the sim bridge test can check each against ForgeEnv) ................
 
@@ -221,10 +234,23 @@ class ForgePolicyRunner:
         return obs.astype(np.float32)
 
     def apply_action(self, mu, fingertip_pos, fingertip_quat):
-        """EMA + ForgeEnv._apply_action for one env. Updates self.actions; returns pose target."""
+        """update_actions(mu) then target(pose): one policy step's action, first physics step's target."""
+        self.update_actions(mu)
+        return self.target(fingertip_pos, fingertip_quat)
+
+    def update_actions(self, mu) -> np.ndarray:
+        """FactoryEnv._pre_physics_step: EMA of the clamped policy mean. Once per policy step."""
         cfg = self.cfg
         mu = np.clip(np.asarray(mu, dtype=float), -1.0, 1.0)  # rl_games player clamps to [-1, 1]
         self.actions = cfg.ema_factor * mu + (1.0 - cfg.ema_factor) * self.actions
+        return self.actions
+
+    def target(self, fingertip_pos, fingertip_quat):
+        """ForgeEnv._apply_action for one env: pose target from the current actions and pose.
+
+        Pure function of self.actions and the given pose; call it every control tick (>= 120 Hz).
+        """
+        cfg = self.cfg
         a = self.actions
         fingertip_pos = np.asarray(fingertip_pos, dtype=float)
 

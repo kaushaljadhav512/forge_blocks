@@ -110,6 +110,22 @@ class TestRunner(unittest.TestCase):
         target_pos, _ = runner.apply_action(mu, pos, quat)
         np.testing.assert_allclose(target_pos - pos, [0.02, -0.02, -0.02], atol=1e-9)
 
+    def test_target_follows_pose_between_steps(self):
+        """target() re-clips around each new pose (ForgeEnv does this every physics step)."""
+        cfg = make_cfg(ema_factor=1.0)
+        runner = ForgePolicyRunner(cfg)
+        pos, quat = self.slot + [0.0, 0.0, 0.04], hand_down(0.0)
+        runner.reset(pos, quat, self.slot)
+        runner.update_actions(np.array([0.0, 0.0, -1.0, 0.0, 0.0, runner.actions[5], -1.0]))
+        actions = runner.actions.copy()
+        t0, _ = runner.target(pos, quat)
+        moved = pos + [0.0, 0.0, -0.005]
+        t1, _ = runner.target(moved, quat)
+        np.testing.assert_allclose(t0 - pos, [0.0, 0.0, -0.02], atol=1e-9)
+        np.testing.assert_allclose(t1 - moved, [0.0, 0.0, -0.02], atol=1e-9)  # clip moves with the hand
+        np.testing.assert_array_equal(runner.actions, actions)  # target() doesn't touch the actions
+        np.testing.assert_allclose(runner.target(moved, quat)[0], t1)
+
     def test_ema(self):
         pos, quat = self.slot + [0.0, 0.0, 0.02], hand_down(0.0)
         self.runner.reset(pos, quat, self.slot)
