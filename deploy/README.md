@@ -128,7 +128,7 @@ on a board.
   **Weak-force dead band.** Franka's external-force estimate is unreliable below about 5 N (from the
   course TA). Modelled as an observed force that reads zero below the band and is shrunk by the band
   above it: a 5 N dead band costs 20–30 points, 2.5 N costs 6–11. Raising the contact threshold to
-  10 N doesn't win it back. Measure the real curve with `run_peg.py force-curve`; if it shows a dead
+  10 N doesn't win it back. Measure the real curve with `run_peg.py force-scale` / `force-weights`; if it shows a dead
   band of more than ~2 N, retrain with a random dead band (0–5 N) plus a random force offset.
 
 ### Phase 1: hardware
@@ -173,6 +173,8 @@ and Lab2; check them against the installed version.
 
 ### Phase 3: calibration on the robot
 
+Step-by-step instructions for whoever runs it in the lab: [`LAB_RUNBOOK.md`](LAB_RUNBOOK.md).
+
 Commands are `python3 deploy/run_peg.py <command>`. Moving commands need `--ack-safety` and an
 E-stop operator. State (`calibration.json`, `hole.json`, logs) goes to `deploy/runs/`.
 
@@ -187,8 +189,19 @@ E-stop operator. State (`calibration.json`, `hole.json`, logs) goes to `deploy/r
 4. `press-test`: lowers the held peg onto a **free flat surface** (not the hole) until the force
    builds up, and saves `force_sign` so that pressing reads +z, as in sim. Use the robot for this,
    not your hand: a hand pushing down on the gripper is a force in the opposite direction.
-   Then `force-curve`: pushes the peg into the surface in steps and prints commanded push vs measured
-   |fz|, plus the free-space noise. This shows how big the dead band below ~5 N really is.
+   Then the force-estimate checks (each saves a JSON in `deploy/runs/` and a summary in `calibration.json`):
+   - `force-curve`: pushes the peg into the surface in a ramp; commanded push vs measured |fz|. Quick,
+     but joint friction makes the commanded push an imperfect reference.
+   - `force-scale`: the same press on a **zeroed kitchen scale**, held at 1, 2, 3, 4, 5, 6, 8, 10 N
+     commanded; you type the scale's grams at each. Splits the loss into actuation (commanded → scale,
+     joint friction, which the sim models) and sensing (scale → estimate, the TA's dead band).
+   - `force-weights`: arm holds still in free space; hang known masses from the peg on a string loop
+     and type each total in grams (weigh them on the kitchen scale first; start with 0, end with 0).
+     No contact and no controller in the way, and it checks `force_sign` independently of `press-test`.
+     `--direction 1 0 0` etc. for a sideways pull over a pulley (the policy uses x and y force too).
+   - `force-drift`: tare like an attempt, hold still 15 s, then move 4 cm down and back in free space.
+     Every reading is error: drift over an attempt and error that changes with the arm's pose.
+     Needs 5 cm clear below the peg.
 5. `register-hole`: guide mode, 5 times: seat the peg fully by hand and hold it still. Saves the
    seated fingertip pose; the rim centre is 7.1 mm below it (32.1 mm grasp − 25 mm depth). The spread
    should be under 0.5 mm.
@@ -236,7 +249,7 @@ bands, then `summary`:
 | Peg slipping in the grasp | 40 N grasp; the safety floor catches a peg pushed up in the fingers |
 | Real impedance controller ≠ sim controller (the sim also cancels inertia and has a dead zone) | Stiffness stress evals; the sim already randomizes stiffness by ±41% |
 | Stream or state rate too low | `rate-test` (rates and 2 mm step latency); one 67 ms step of delay costs 10–15 points in sim |
-| Force estimate dead below ~5 N | `force-curve` measures it; a 5 N dead band costs 20–30 points in sim; retrain with a random dead band if needed |
+| Force estimate dead below ~5 N | `force-scale` and `force-weights` measure it; a 5 N dead band costs 20–30 points in sim; retrain with a random dead band if needed |
 | Policy file won't load on the lab computer | Check the torch version first; re-export |
 | Error in the hole registration | Repeat the hand-guided registration 5 times |
 | Printed parts off-size | Clearance coupon (`../hardware/README.md`); measure and report the actual clearance |

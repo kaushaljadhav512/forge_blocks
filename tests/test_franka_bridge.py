@@ -23,9 +23,14 @@ RIM = np.array([0.59, 0.0, 0.028])
 
 
 class FakeArm:
-    def __init__(self, raw_sign=1.0, bias=(0.0, 0.0, 0.0), tau=0.1, R=fb.DOWN, spike_at=None, sense_deadband=0.0):
+    def __init__(self, raw_sign=1.0, bias=(0.0, 0.0, 0.0), tau=0.1, R=fb.DOWN, spike_at=None, sense_deadband=0.0,
+                 act_deadband=0.0, drift=(0.0, 0.0, 0.0), z_gain=(0.0, 0.0, 0.0)):
         self.t = 0.0
         self.tip = RIM + np.array([0.0, 0.0, fb.START_ABOVE_RIM])
+        self.z0 = None  # z_gain reference: the first tip height read
+        self.act_deadband = act_deadband  # joint friction: this much of the spring force never reaches the surface
+        self.drift, self.z_gain = np.array(drift), np.array(z_gain)  # estimate error: N/s and N/m of tip z
+        self.ext_load = np.zeros(3)  # e.g. a hanging mass: force of the environment on the hand
         self.R = np.array(R, dtype=float)
         self.target = None
         self.raw_sign, self.bias, self.tau, self.spike_at = raw_sign, np.array(bias), tau, spike_at
@@ -55,12 +60,15 @@ class FakeArm:
     def env_force(self):
         if self.target is None or self.tip[2] > self._floor_tip_z(self.tip) + 1e-9:
             return np.zeros(3)
-        return np.array([0.0, 0.0, 565.0 * max(0.0, self.tip[2] - self.target[2])])  # surface pushes up
+        push = max(0.0, 565.0 * max(0.0, self.tip[2] - self.target[2]) - self.act_deadband)
+        return np.array([0.0, 0.0, push])  # surface pushes up
 
     def read(self):
-        f = self.env_force()
+        if self.z0 is None:
+            self.z0 = self.tip[2]
+        f = self.env_force() + self.ext_load
         f = np.sign(f) * np.clip(np.abs(f) - self.sense_deadband, 0.0, None)  # unreliable small forces
-        f = self.raw_sign * f + self.bias
+        f = self.raw_sign * f + self.bias + self.drift * self.t + self.z_gain * (self.tip[2] - self.z0)
         if self.spike_at is not None and self.t > self.spike_at:
             f = f + np.array([0.0, 0.0, 100.0])
         return fb.RobotState(t=self.t, q=np.zeros(7), dq=np.zeros(7), tool_pos=fb.tip_to_tool(self.tip, self.R),
@@ -208,6 +216,74 @@ class TestCalibration(unittest.TestCase):
             table = {round(r["cmd_N"] - 0.5): r["mean_abs_fz_N"] for r in out["table"]}
             self.assertAlmostEqual(table[10], max(10.5 - band, 0.0), delta=0.6)
             self.assertAlmostEqual(table[2], max(2.5 - band, 0.0), delta=0.6)
+
+    def test_force_scale_separates_actuation_and_sensing(self):
+        arm = FakeArm(act_deadband=1.5, sense_deadband=3.0, bias=(0.2, 0.0, -1.0))
+        arm.tip = RIM + [0.03, 0.0, fb.GRASP_TIP_ABOVE_PEG_BOTTOM + 0.01]
+        scale_g = lambda prompt: f"{arm.env_force()[2] / fb.G * 1000:.0f}"  # the scale sees the true push
+        out = fb.force_scale(arm, fb.BridgeConfig(tare_s=0.05), read_scale=scale_g, descend_m_s=0.02,
+                             settle_s=0.5, hold_s=0.3, clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+        self.assertEqual(len(out["rows"]), 8)
+        self.assertAlmostEqual(out["actuation"]["deadband_N"], 1.5, delta=0.2)
+        self.assertAlmostEqual(out["sensing"]["deadband_N"], 3.0, delta=0.2)
+        self.assertAlmostEqual(out["sensing"]["slope"], 1.0, delta=0.05)
+        low = out["rows"][0]  # 1 N commanded: nothing reaches the scale, nothing sensed
+        self.assertLess(low["scale_N"], 0.05)
+        self.assertLess(low["est_abs_z_N"], 0.05)
+
+    def test_force_weights_reads_masses_and_checks_sign(self):
+        for raw_sign, band in ((1.0, 0.0), (-1.0, 2.0)):
+            arm = FakeArm(raw_sign=raw_sign, sense_deadband=band, bias=(0.5, -0.3, 2.0))
+            masses = iter(["0", "100", "250", "500", "1000", "0", ""])
+
+            def hang(prompt):
+                m = next(masses)
+                arm.ext_load = np.array([0.0, 0.0, -float(m or 0) * fb.G / 1000])  # weight pulls the hand down
+                return m
+
+            # press-test would give force_sign = +1 for raw_sign +1 (pressing reads +z raw) and -1 otherwise
+            out = fb.force_weights(arm, fb.BridgeConfig(), ask_mass=hang, force_sign=raw_sign, settle_s=0.2,
+                                   hold_s=0.2, clock=arm.clock, sleep=arm.sleep)
+            self.assertFalse(arm.streaming)
+            self.assertEqual([r["mass_g"] for r in out["rows"]], [0, 100, 250, 500, 1000, 0])
+            self.assertTrue(out["sign_ok"])
+            heavy = out["rows"][4]
+            self.assertAlmostEqual(heavy["est_along_abs_N"], 9.81 - band, delta=0.05)
+            self.assertLess(heavy["est_off_axis_N"], 0.05)
+            self.assertLess(out["rows"][-1]["est_along_abs_N"], 0.05)  # back to zero
+            if band:
+                self.assertAlmostEqual(out["sensing"]["deadband_N"], band, delta=0.1)
+                self.assertLess(out["rows"][1]["est_along_abs_N"], 0.05)  # 100 g ~ 1 N: inside the dead band
+        # a sign from press-test that disagrees with the weights is flagged
+        arm = FakeArm()
+        masses = iter(["500", ""])
+        def hang(prompt):
+            m = next(masses)
+            arm.ext_load = np.array([0.0, 0.0, -float(m or 0) * fb.G / 1000])
+            return m
+        out = fb.force_weights(arm, fb.BridgeConfig(), ask_mass=hang, force_sign=-1.0, settle_s=0.2, hold_s=0.2,
+                               clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(out["sign_ok"])
+
+    def test_force_drift_measures_drift_and_pose_error(self):
+        arm = FakeArm(bias=(1.0, 1.0, 1.0), drift=(0.0, 0.05, 0.0), z_gain=(0.0, 0.0, 20.0))  # 0.2 N per cm
+        out = fb.force_drift(arm, fb.BridgeConfig(tare_s=0.05), hold_s=4.0, sweep_m=0.04, sweep_m_s=0.04,
+                             clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+        self.assertAlmostEqual(out["hold_slope_N_per_s"][1], 0.05, delta=0.005)
+        self.assertAlmostEqual(out["hold_end_mean_N"][1], 0.05 * 3.5, delta=0.05)  # tare taken at t ~ 0
+        self.assertAlmostEqual(out["sweep_slope_N_per_cm"][2], 0.2, delta=0.02)
+        self.assertAlmostEqual(out["sweep_max_abs_N"][2], 0.8, delta=0.1)
+        self.assertLess(abs(out["hold_end_mean_N"][0]), 0.01)  # constant bias is removed by the tare
+
+    def test_force_drift_stops_on_contact(self):
+        arm = FakeArm()
+        arm.tip = RIM + [0.03, 0.0, fb.GRASP_TIP_ABOVE_PEG_BOTTOM + 0.01]  # surface 1 cm below, sweep 4 cm
+        with self.assertRaises(fb.SafetyStop):
+            fb.force_drift(arm, fb.BridgeConfig(tare_s=0.05), hold_s=0.2, sweep_m=0.04, sweep_m_s=0.04,
+                           clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
 
     def test_rate_test_reports_step_latency(self):
         arm = FakeArm(tau=0.05)

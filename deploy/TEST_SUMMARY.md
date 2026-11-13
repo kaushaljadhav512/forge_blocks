@@ -18,7 +18,7 @@ has run on the real robot yet.**
 
 `tests/test_observation.py`, `tests/test_franka_bridge.py` (plus the other `tests/` files).
 
-- **Laptop:** 35 run, 14 skipped (they need torch), all pass.
+- **Laptop:** 39 run, 14 skipped (they need torch), all pass.
 - **mrsd26c container:** 33 run, all pass.
 
 What they cover:
@@ -33,6 +33,9 @@ What they cover:
   - force tare;
   - `press-test` sign detection;
   - `force-curve` recovers the fake arm's dead band;
+  - `force-scale` separates a 1.5 N actuation dead zone from a 3 N sensing dead band;
+  - `force-weights` reads hung masses, fits the dead band, and flags a `force_sign` that disagrees;
+  - `force-drift` recovers a 0.05 N/s drift and a 0.2 N/cm pose-dependent error, and stops on contact;
   - `rate-test` reports the fake arm's 50 ms lag;
   - start-pose and error samplers;
   - saving and loading the hole registration.
@@ -129,8 +132,9 @@ In order, using `deploy/run_peg.py`:
 3. `rate-test`: stream and state rates, policy inference time, and 2 mm step latency (first motion
    and 63% of the step).
 4. `press-test`: force sign; it must read +z when pressing, as in sim (test 3).
-5. `force-curve`: commanded push vs measured |fz|, and free-space noise. This gives the real dead band
-   and offset to compare against test 5.
+5. `force-curve`, then `force-scale` (kitchen scale), `force-weights` (hung masses) and `force-drift`
+   (15 s hold + 4 cm move in free space). These give the real sensing dead band, the actuation loss,
+   a second sign check, and the drift, to compare against the stress results in test 5.
 
 **Decision after step 5:** if the dead band is ≥ 2 N or the offset drifts more than ~1 N, retrain with a
 random dead band (0–5 N) and a random force offset during training (~1h45m per seed on mrsd26c).

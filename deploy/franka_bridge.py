@@ -616,3 +616,222 @@ def force_curve(arm, cfg: BridgeConfig, descend_m_s=0.004, max_descent=0.08, sta
             table.append({"cmd_N": float(lo + bins_N / 2), "mean_abs_fz_N": float(np.mean(sel)), "n": len(sel)})
     free = [s["force"] for s in samples if not s["contact"]]
     return {"samples": samples, "table": table, "free_space_std_N": np.std(free, axis=0).tolist() if free else None}
+
+
+# --- Force-estimate checks with a known reference (scale, weights) and drift ------------------------
+#
+# force_curve compares the estimate with the *commanded* push, which joint friction can eat, so it
+# can't tell "the estimate misses small forces" (sensing dead band, the TA's warning) from "small
+# commands never reach the surface" (actuation dead zone, which the sim already randomizes).
+# force_scale and force_weights use a reference that doesn't depend on the robot; force_drift checks
+# how far the tared estimate wanders in free space, where every reading is error.
+
+G = 9.80665
+
+
+def _hold(arm, tool_pos, R, cfg: BridgeConfig, seconds, clock, sleep, task=None, tare=None, samples=None,
+          max_force_N=25.0):
+    """Keep streaming tool_pos (a stream must be running) for at least `seconds` and until `task`
+    returns. `task` runs in a thread (it waits for the operator) so the target keeps flowing.
+    Appends tared force samples to `samples`. Returns the task's result."""
+    import threading
+
+    tare = np.zeros(3) if tare is None else tare
+    box = {}
+
+    def run():
+        try:
+            box["result"] = task()
+        except BaseException as e:  # re-raised in the control thread
+            box["error"] = e
+
+    thread = None
+    if task is not None:
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+    t0 = clock()
+    while clock() - t0 < seconds or (thread is not None and thread.is_alive()):
+        f = arm.read().force - tare
+        if np.linalg.norm(f) > max_force_N:
+            raise SafetyStop(f"force {np.linalg.norm(f):.1f} N > {max_force_N} N")
+        if samples is not None:
+            samples.append(f)
+        arm.send_target(tool_pos, R)
+        sleep(1.0 / cfg.control_hz)
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _ask_float(ask, prompt, allow_empty=False):
+    while True:
+        s = str(ask(prompt)).strip()
+        if allow_empty and s == "":
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            print(f"not a number: {s!r}")
+
+
+def _deadband_fit(x, y, min_y=0.5):
+    """Fit y = a*x - b on the points where y > min_y (above any dead band). Returns slope a and the
+    x-intercept b/a: the width of the dead band in the units of x. None with fewer than 2 points."""
+    pts = [(xi, yi) for xi, yi in zip(x, y) if yi > min_y]
+    if len(pts) < 2:
+        return {"slope": None, "deadband_N": None, "points": len(pts)}
+    a, c = np.polyfit([p[0] for p in pts], [p[1] for p in pts], 1)
+    return {"slope": float(a), "deadband_N": float(-c / a) if a > 0 else None, "points": len(pts)}
+
+
+def force_scale(arm, cfg: BridgeConfig, levels_N=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0), read_scale=input,
+                descend_m_s=0.004, max_descent=0.08, stall_m=0.003, settle_s=1.0, hold_s=2.0,
+                clock=time.monotonic, sleep=time.sleep):
+    """Press the held peg on a kitchen scale at a ladder of commanded pushes; the operator types the
+    scale reading (grams) at each. Separates the two effects force_curve mixes up:
+        commanded -> scale : actuation loss (joint friction; the sim's dead zone models this)
+        scale -> estimate  : sensing error (the TA's "unreliable below ~5 N")
+    Start with the peg 1-5 cm above the scale, scale zeroed."""
+    k = cfg.stiffness[2]
+    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
+    st = arm.read()
+    start_tool, R = st.tool_pos.copy(), st.tool_R.copy()
+    start_tip = tool_to_tip(start_tool, R, cfg.tip_offset)
+    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=3600)
+    rows = []
+    try:
+        # Down until the fingertip stalls on the scale (from position, so a sensing dead band can't hide it).
+        t0 = clock()
+        while True:
+            depth = descend_m_s * (clock() - t0)
+            if depth > max_descent:
+                raise HardwareError("no contact within the descent limit; is the scale below the peg?")
+            target_tip = start_tip - np.array([0.0, 0.0, depth])
+            st = arm.read()
+            tip = tool_to_tip(st.tool_pos, st.tool_R, cfg.tip_offset)
+            if tip[2] - target_tip[2] > stall_m:
+                surface_z = float(tip[2])
+                break
+            if np.linalg.norm(st.force - tare) > 25.0:
+                raise SafetyStop("force above 25 N while descending")
+            arm.send_target(tip_to_tool(target_tip, R, cfg.tip_offset), R)
+            sleep(1.0 / cfg.control_hz)
+        for F in levels_N:
+            target_tip = np.array([start_tip[0], start_tip[1], surface_z - F / k])  # spring: F = k * depth
+            tool = tip_to_tool(target_tip, R, cfg.tip_offset)
+            _hold(arm, tool, R, cfg, settle_s, clock, sleep)
+            samples = []
+            grams = _hold(arm, tool, R, cfg, hold_s, clock, sleep, tare=tare, samples=samples,
+                          task=lambda F=F: _ask_float(read_scale, f"commanded {F:4.1f} N - scale reading (g)? "))
+            est = np.mean(samples, axis=0)
+            rows.append({"cmd_N": float(F), "scale_N": grams * G / 1000.0, "scale_g": grams, "est_N": est.tolist(),
+                         "est_abs_z_N": float(abs(est[2])), "n": len(samples)})
+    finally:
+        arm.stop_stream()
+        arm.goto(start_tool, R, 3.0)
+    return {
+        "rows": rows,
+        "tare_N": tare.tolist(),
+        # x-intercepts: the force at which the scale / the estimate start to respond
+        "actuation": _deadband_fit([r["cmd_N"] for r in rows], [r["scale_N"] for r in rows]),
+        "sensing": _deadband_fit([r["scale_N"] for r in rows], [r["est_abs_z_N"] for r in rows]),
+    }
+
+
+def force_weights(arm, cfg: BridgeConfig, ask_mass=input, direction=(0.0, 0.0, -1.0), force_sign=None,
+                  settle_s=1.5, hold_s=2.0, max_items=30, clock=time.monotonic, sleep=time.sleep):
+    """Hold still in free space; the operator hangs known masses from the peg or gripper (string loop)
+    and types each total mass in grams (0 = nothing hanging, empty = done). A hanging mass is a
+    known, static force with no contact and no controller in the way: m*g along `direction` (the way
+    the string pulls the hand; -z for a plain hanging weight, +-x/+-y over a pulley).
+
+    With force_sign (from press-test), also checks the sign independently: in the sim's convention
+    (force of the environment on the hand) the reading along `direction` must be +m*g."""
+    d = np.asarray(direction, dtype=float)
+    d = d / np.linalg.norm(d)
+    st = arm.read()
+    hold_tool, R = st.tool_pos.copy(), st.tool_R.copy()
+    arm.start_stream(hold_tool, R, cfg.stiffness, max_duration=3600)
+    rows = []
+    try:
+        _hold(arm, hold_tool, R, cfg, settle_s, clock, sleep)
+        tare_samples = []
+        _hold(arm, hold_tool, R, cfg, hold_s, clock, sleep, samples=tare_samples)
+        tare = np.mean(tare_samples, axis=0)  # nothing hanging
+        for _ in range(max_items):
+            grams = _hold(arm, hold_tool, R, cfg, 0.0, clock, sleep, task=lambda: _ask_float(
+                ask_mass, "hang the next mass and type its TOTAL grams (0 = nothing, Enter = done): ", allow_empty=True))
+            if grams is None:
+                break
+            _hold(arm, hold_tool, R, cfg, settle_s, clock, sleep)
+            samples = []
+            _hold(arm, hold_tool, R, cfg, hold_s, clock, sleep, tare=tare, samples=samples)
+            est = np.mean(samples, axis=0)
+            along = float(est @ d)
+            row = {"mass_g": grams, "true_N": grams * G / 1000.0, "est_N": est.tolist(), "est_along_abs_N": abs(along),
+                   "est_off_axis_N": float(np.linalg.norm(est - along * d)), "std_N": np.std(samples, axis=0).tolist()}
+            if force_sign is not None:
+                row["est_along_sim_N"] = force_sign * along  # should be +true_N
+            rows.append(row)
+    finally:
+        arm.stop_stream()
+    out = {"rows": rows, "direction": d.tolist(), "tare_N": tare.tolist(),
+           "sensing": _deadband_fit([r["true_N"] for r in rows], [r["est_along_abs_N"] for r in rows])}
+    if force_sign is not None:
+        loaded = [r for r in rows if r["true_N"] > 1.0 and r["est_along_abs_N"] > 0.5]
+        out["sign_ok"] = all(r["est_along_sim_N"] > 0 for r in loaded) if loaded else None
+    return out
+
+
+def force_drift(arm, cfg: BridgeConfig, hold_s=15.0, sweep_m=0.04, sweep_m_s=0.01, max_force_N=10.0,
+                clock=time.monotonic, sleep=time.sleep):
+    """Tare like an attempt does, then (1) hold still for hold_s and (2) move straight down sweep_m and
+    back, all in free space. Nothing touches the peg, so every reading is error: (1) is drift over an
+    attempt's duration, (2) is the pose-dependent error over an attempt's range of motion. The sim
+    loses a few points at 1 N of offset and 10-20 at 2 N. Needs sweep_m + 1 cm of free space below."""
+    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
+    st = arm.read()
+    start_tool, R = st.tool_pos.copy(), st.tool_R.copy()
+    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=hold_s + 2 * sweep_m / sweep_m_s + 10)
+    hold, sweep = [], []
+    try:
+        t0 = clock()
+        while clock() - t0 < hold_s:
+            st = arm.read()
+            hold.append((clock() - t0, st.force - tare))
+            if np.linalg.norm(hold[-1][1]) > max_force_N:
+                raise SafetyStop("force in free space; is something touching the peg?")
+            arm.send_target(start_tool, R)
+            sleep(1.0 / cfg.control_hz)
+        t1, T = clock(), sweep_m / sweep_m_s
+        while clock() - t1 < 2 * T:
+            s = clock() - t1
+            depth = sweep_m_s * (s if s < T else 2 * T - s)
+            st = arm.read()
+            sweep.append((float(st.tool_pos[2] - start_tool[2]), st.force - tare))
+            if np.linalg.norm(sweep[-1][1]) > max_force_N:
+                raise SafetyStop("force in free space; is something below the peg?")
+            arm.send_target(start_tool - np.array([0.0, 0.0, depth]), R)
+            sleep(1.0 / cfg.control_hz)
+    finally:
+        arm.stop_stream()
+        arm.goto(start_tool, R, 3.0)
+    ht = np.array([t for t, _ in hold])
+    hf = np.array([f for _, f in hold])
+    out = {
+        "hold_s": hold_s,
+        "hold_max_abs_N": np.abs(hf).max(axis=0).tolist(),
+        "hold_end_mean_N": hf[ht > hold_s - 1.0].mean(axis=0).tolist(),
+        "hold_slope_N_per_s": [float(np.polyfit(ht, hf[:, i], 1)[0]) for i in range(3)],
+        "hold_std_N": hf.std(axis=0).tolist(),
+    }
+    if sweep:
+        sz = np.array([z for z, _ in sweep])
+        sf = np.array([f for _, f in sweep])
+        out["sweep_m"] = sweep_m
+        out["sweep_max_abs_N"] = np.abs(sf).max(axis=0).tolist()
+        out["sweep_slope_N_per_cm"] = [float(np.polyfit(sz, sf[:, i], 1)[0]) / 100.0 if np.ptp(sz) > 1e-4 else None
+                                       for i in range(3)]
+    out["worst_norm_N"] = float(max(np.linalg.norm(hf, axis=1).max(),
+                                    np.linalg.norm(np.array([f for _, f in sweep]), axis=1).max() if sweep else 0.0))
+    return out

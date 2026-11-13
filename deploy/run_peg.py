@@ -2,10 +2,15 @@
 """Peg insertion on the real Franka. Order of use (deploy/README.md, Phases 3-5):
 
     run_peg.py check                                   read-only: state, frames, force, gripper
+    run_peg.py home --ack-safety                       FrankaPy's reset_joints (gripper down, above the table)
+    run_peg.py guide --seconds 20 --ack-safety         guide mode: move the arm by hand
     run_peg.py rate-test --export EXPORT --ack-safety  holds pose, then 2 mm up step: rates, latency, policy time
     run_peg.py grasp --ack-safety                      close on the peg (finger ends on the 32 mm line)
     run_peg.py press-test --ack-safety                 peg pressed on a free surface -> force_sign
     run_peg.py force-curve --ack-safety                force estimate vs commanded push, 0-15 N
+    run_peg.py force-scale --ack-safety                press on a kitchen scale: commanded vs true vs estimate
+    run_peg.py force-weights --ack-safety              hang known masses in free space: true vs estimate, sign
+    run_peg.py force-drift --ack-safety                free space: drift over 15 s and error over a 4 cm move
     run_peg.py register-hole --ack-safety              hand-guide into the hole 5x -> hole.json
     run_peg.py shadow --export EXPORT                  guide mode; policy runs but commands nothing
     run_peg.py run --export EXPORT --air --trials 1 --ack-safety          estimate 10 cm high: no contact
@@ -55,6 +60,25 @@ def save_calib(d, **kw):
     return calib
 
 
+def print_fit(label, fit):
+    if fit["deadband_N"] is None:
+        print(f"{label}: not enough points above 0.5 N to fit")
+    else:
+        print(f"{label}: responds from ~{fit['deadband_N']:.2f} N, slope {fit['slope']:.2f} ({fit['points']} points)")
+
+
+def save_check(d, name, out):
+    """Raw results to <dir>/<name>_<time>.json; the last summary of each check into calibration.json."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(d) / f"{name}_{stamp}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2))
+    summary = {k: v for k, v in out.items() if k != "rows"}
+    save_calib(d, **{name: summary})
+    log_event(Path(d) / "events.jsonl", event=name, file=path.name, **summary)
+    print("saved", path)
+
+
 def bridge_cfg(args, calib):
     cfg = fb.BridgeConfig(control_hz=args.control_hz)
     if "quat_ref" in calib:
@@ -84,6 +108,9 @@ def main(argv=None):
         return a
 
     add("check")
+    add("home", moves=True)
+    a = add("guide", moves=True)
+    a.add_argument("--seconds", type=float, default=20.0)
     a = add("rate-test", moves=True)
     a.add_argument("--export", help="also time the policy")
     a.add_argument("--force_threshold", type=float, default=7.5)
@@ -92,6 +119,14 @@ def main(argv=None):
     add("open", moves=True)
     add("press-test", moves=True)
     add("force-curve", moves=True)
+    a = add("force-scale", moves=True)
+    a.add_argument("--levels", type=float, nargs="+", default=[1, 2, 3, 4, 5, 6, 8, 10], help="commanded pushes (N)")
+    a = add("force-weights", moves=True)
+    a.add_argument("--direction", type=float, nargs=3, default=[0.0, 0.0, -1.0],
+                   help="way the string pulls the hand, base frame (0 0 -1: hanging; over a pulley: 1 0 0 etc.)")
+    a = add("force-drift", moves=True)
+    a.add_argument("--seconds", type=float, default=15.0)
+    a.add_argument("--sweep_m", type=float, default=0.04)
     a = add("register-hole", moves=True)
     a.add_argument("--n", type=int, default=5)
     a = add("shadow", export=True)
@@ -127,6 +162,16 @@ def main(argv=None):
         print("Jacobian from FrankaPy:", "yes" if st.J is not None else "no (velocities from pose differences)")
         print("gripper width (m):", round(float(arm.fa.get_gripper_width()), 4))
         print("calibration:", calib or "none yet")
+        return 0
+
+    if args.cmd == "home":
+        confirm("Arm moves to FrankaPy's home pose. Path clear?")
+        arm.fa.reset_joints()
+        return 0
+
+    if args.cmd == "guide":
+        print(f"Guide mode for {args.seconds:.0f} s: move the arm by hand.")
+        arm.guide(args.seconds, block=True)
         return 0
 
     if args.cmd == "rate-test":
@@ -167,6 +212,49 @@ def main(argv=None):
             print(f"  {row['cmd_N']:5.1f} -> {row['mean_abs_fz_N']:5.2f}   (n={row['n']})")
         print("free-space std (N):", np.round(out["free_space_std_N"], 2).tolist() if out["free_space_std_N"] else None)
         print("saved", path)
+        return 0
+
+    if args.cmd == "force-scale":
+        confirm("Kitchen scale on the table under the peg, ZEROED, peg grasped 1-5 cm above it?")
+        out = fb.force_scale(arm, cfg, levels_N=args.levels)
+        print("commanded (N)   scale (N)   |estimate z| (N)")
+        for r in out["rows"]:
+            print(f"  {r['cmd_N']:6.1f}     {r['scale_N']:6.2f}      {r['est_abs_z_N']:6.2f}")
+        print_fit("actuation (commanded -> scale)", out["actuation"])
+        print_fit("sensing   (scale -> estimate) ", out["sensing"])
+        save_check(args.dir, "force_scale", out)
+        return 0
+
+    if args.cmd == "force-weights":
+        if "force_sign" not in calib:
+            print("no force_sign yet (press-test): the sign check is skipped")
+        confirm("Arm in free space, peg grasped, string loop ready for the weights, NOTHING hanging now?")
+        out = fb.force_weights(arm, cfg, direction=args.direction, force_sign=calib.get("force_sign"))
+        print("mass (g)   true (N)   |estimate along| (N)   off-axis (N)")
+        for r in out["rows"]:
+            print(f"  {r['mass_g']:6.0f}    {r['true_N']:6.2f}      {r['est_along_abs_N']:6.2f}            "
+                  f"{r['est_off_axis_N']:5.2f}")
+        print_fit("sensing (true -> estimate)", out["sensing"])
+        if "sign_ok" in out:
+            print("sign agrees with press-test:", out["sign_ok"])
+        save_check(args.dir, "force_weights", out)
+        return 0
+
+    if args.cmd == "force-drift":
+        confirm(f"Arm in free space with at least {100 * args.sweep_m + 1:.0f} cm clear below the peg?")
+        out = fb.force_drift(arm, cfg, hold_s=args.seconds, sweep_m=args.sweep_m)
+        fmt = lambda v: "  ".join("   n/a" if x is None else f"{x:6.2f}" for x in v)
+        print("                              x       y       z")
+        print("hold: max |f| (N)          ", fmt(out["hold_max_abs_N"]))
+        print("hold: last 1 s mean (N)    ", fmt(out["hold_end_mean_N"]))
+        print("hold: drift (N/s)          ", fmt(out["hold_slope_N_per_s"]))
+        print("hold: noise std (N)        ", fmt(out["hold_std_N"]))
+        if "sweep_max_abs_N" in out:
+            print("sweep: max |f| (N)         ", fmt(out["sweep_max_abs_N"]))
+            print("sweep: change per cm (N/cm)", fmt(out["sweep_slope_N_per_cm"]))
+        print(f"worst |f| anywhere: {out['worst_norm_N']:.2f} N")
+        print("sim budget: under ~1 N of offset costs a few points; 2 N costs 10-20")
+        save_check(args.dir, "force_drift", out)
         return 0
 
     if args.cmd == "register-hole":
