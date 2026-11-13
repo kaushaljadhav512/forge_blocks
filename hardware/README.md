@@ -24,7 +24,7 @@ Units are mm. "Diametral clearance" is the hole diameter minus the peg diameter.
         │ │   Ø 7.98
         │ │
         │ │  50.0 long
-   ─ ─ ─│─│─ ─ ─  grasp line: 32.0 from the bottom
+   ─ ─ ─│─│─ ─ ─  grasp line: 32.0 from the bottom (finger ends go here)
         │ │
         │ │
         └─┘  ← 0.5 × 45° chamfer (bottom)
@@ -35,7 +35,7 @@ Units are mm. "Diametral clearance" is the hole diameter minus the peg diameter.
 | Diameter | 7.98 | ±0.05 |
 | Length | 50.0 | ±0.3 |
 | Chamfers, both ends | 0.5 × 45° | not critical |
-| Grasp line | 32.0 from the bottom end | Mark it with a fine marker; **don't** cut a groove |
+| Grasp line | 32.0 from the bottom end | Mark it with a fine marker; **don't** cut a groove. The **ends of the gripper fingers** go on this line, so 32 mm of peg sticks out below them. The pad centres sit about 9 mm higher |
 
 - **Print it standing up** (axis vertical), so the cross-section comes out round. A peg printed on its
   side comes out oval with a flat face.
@@ -98,8 +98,8 @@ matched pair matters more than either exact number.
 
 ## 4. Grasp jig (optional)
 
-The sim always grasps the peg **32 mm above its bottom end** (±2 mm). The jig holds the peg upright
-so the robot can pick it up at that height every time.
+The sim always grasps the peg with the **finger ends 32 mm above its bottom end** (±2 mm). The jig
+holds the peg upright so the robot can pick it up at that height every time.
 
 - A block about 40 × 40 × 20 with a **Ø8.6 blind hole, 18 deep**, so the peg stands loosely with 32
   sticking out.

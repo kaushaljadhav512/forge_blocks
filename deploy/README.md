@@ -64,11 +64,25 @@ These come from `scripts/measure_frames.py`; the full output is in `results/meas
 | Peg | Ø7.98 × 50 mm, 0.5 mm chamfers, 19 g | `../hardware/README.md` |
 | Hole | **Ø9.0** × 25 mm deep, 0.5 mm top chamfer, so about **1 mm clearance** | The task config says 8.1 mm, but the collision mesh is 9.0. The mesh is what the policy trained against |
 
-**Fingertip frame.** What matters is that the same point is used both to register the hole and at run
-time, and that the **real grasp puts that point 32 mm above the peg's bottom.** A constant offset along
-the tool axis then cancels out. Use FrankaPy's end-effector frame at the fingertips (Franka's default
-is 0.1034 m from the flange; the sim's fingers put the point 0.1121 m from the hand frame). Check that
-yaw matches as well: the sim hand frame is the flange rotated −45° about z, like Franka's `panda_hand`.
+**Fingertip frame (FrankaPy → sim).** The lab's Lab2 code (`svvetal/Robot_Autonomy_Lab`, tested on
+this robot) showed that FrankaPy's `get_pose()` is the hand frame shifted 0.103 m along its z axis,
+with the same orientation as the hand frame. The sim's fingertip point is the same hand frame shifted
+0.1121 m. So the bridge only needs a fixed shift, with no rotation:
+
+```
+sim_fingertip_pos = frankapy_pos + R_frankapy @ [0, 0, 0.0087]      sim_fingertip_quat = frankapy_quat
+```
+
+- **Orientation:** gripper pointing down at yaw 0 is `R = diag(1, −1, −1)` in FrankaPy (Lab2's
+  `TOP_R`), which is the sim's start orientation (roll π, yaw 0).
+- **Physical grasp:** the sim point sits at about the **ends of the fingers**, and the pad centres are
+  about 9 mm higher. So the grasp leaves **32 mm of peg below the finger ends**, or 40.8 mm below
+  FrankaPy's tool point.
+
+**Where to put the hole.** In sim the hole is at (0.6, 0) ±5 cm from the robot base. Lab2's cube pickup
+spot, (0.59, 0) on the table, already has proven top-down reach. Put the hole base there. The table top
+is at z ≈ 0 in the base frame, so the boss top is at about z = 0.028 m, or more if the base is raised
+on a board.
 
 ## Phases
 
@@ -81,87 +95,129 @@ yaw matches as well: the sim hand frame is the flange rotated −45° about z, l
   bridge that holds one target for the whole 1/15 s would not match the sim. `sim_bridge_test` now
   checks the target on every substep (2384 checked on seed 2, PASS).
 - [x] Measured the frames and force sign (table above).
+- [x] Quaternion sign. The policy sees the quaternion's x and y only, and they flip with q → −q.
+  In sim, x is always positive (0.93 to 1.0 over the ±45° start yaws), so the bridge picks the sign
+  closest to (0, 1, 0, 0) (`BridgeConfig.quat_ref`).
 - [ ] Stress evals on seed 2 (`results/stress/`), each changing one thing that will differ on the robot:
 
   | Variant | 0–1 mm | 1–2.5 mm | 2.5–5 mm |
   |---|---|---|---|
   | Baseline | 97.9% | 97.4% | 90.5% |
-  | Force sign flipped (`--force_scale -1`) | pending | | |
-  | Force offset 1 N, random direction | pending | | |
-  | Force offset 2 N | pending | | |
-  | Force offset 4 N | pending | | |
+  | Force sign flipped (`--force_scale -1`) | 34.0% | 30.7% | 25.0% |
+  | Force offset 1 N, random direction | 96.5% | 95.4% | 85.0% |
+  | Force offset 2 N | 87.0% | 83.5% | 70.6% |
+  | Force offset 4 N | 34.7% | pending | pending |
   | One policy step of action delay | pending | | |
   | Stiffness × 0.7 | pending | | |
   | Stiffness × 1.3 | pending | | |
 
+  **Force offset is the biggest risk.** 1 N costs a few points, 2 N costs 10–20, and 4 N is as bad as
+  a flipped sign. The tare before each attempt has to leave well under 1 N, and the robot's force
+  estimate must not drift by more than that during the 2–10 s attempt. If it does, retrain with a
+  random per-episode force offset (an `obs_rand` option like the stress test, but during training).
+
 ### Phase 1: hardware
 
-Peg, hole base and grasp jig: see [`../hardware/README.md`](../hardware/README.md). The hole needs to
-be clamped or bolted to the table, because in sim it's welded down. Set the gripper + peg load in Desk,
-or the force estimate will carry a constant offset.
+Peg, hole base and grasp jig: see [`../hardware/README.md`](../hardware/README.md); the printable parts
+are in `../hardware/peg_hole_MK4/`. The hole needs to be clamped or bolted to the table, because in
+sim it's welded down. Set the gripper + peg load in Desk, or the force estimate will carry a constant
+offset.
 
-### Phase 2: the FrankaPy bridge (not written yet)
+### Phase 2: the FrankaPy bridge
+
+Code: [`franka_bridge.py`](franka_bridge.py) (robot side) and [`run_peg.py`](run_peg.py) (command
+line). Tests with a fake arm: `tests/test_franka_bridge.py`. Robot access, the gripper and the safety
+pattern follow Lab2's `hardware/robot.py` and `hardware/execute.py`, which already work on this robot.
+These parts are new: streamed impedance targets, force tare and filtering, velocities from J·q̇, and
+the policy loop.
 
 ```
-1 kHz robot state ─► ForceFilter( force_sign · (O_F_ext_hat_K − tare) )
-                 └─► fingertip pose = O_T_EE (EE frame at the fingertips)
-                     velocity = pose difference over ≈ 1/120 s
-15 Hz:   obs → LSTM → runner.update_actions(mu)        (runner.step does both)
-≥120 Hz: runner.target(latest fingertip pose) → FrankaPy Cartesian impedance
-         stiffness 565 N/m (translation), 28 N·m/rad (rotation)
+each control tick (default 200 Hz):
+    state ← FrankaPy (pose, joints, joint velocities, O_F_ext_hat_K, Jacobian)
+    fingertip = tool pose + 8.7 mm along tool z;  quat sign picked like the sim
+    force = ForceFilter(raw − tare)         (runner applies force_sign)
+    velocity = J·q̇ moved to the fingertip  (pose difference if FrankaPy has no Jacobian)
+    safety check: force, box, speed
+    15 Hz:     obs → LSTM → actions (runner.step);  stop if success prediction > 0.5 or 10 s
+    otherwise: runner.target(latest fingertip pose)
+    stream the target to FrankaPy's dynamic Cartesian impedance skill (565 N/m, 28 N·m/rad)
 ```
 
-- **Tare** the force for about 0.5 s in free space before each attempt. `ForceFilter.reset()` at the
-  start of each attempt, as in sim.
-- **Stop** when the success prediction exceeds 0.5, or after 10 s (150 steps).
-- **Log** observations, actions and targets at 15 Hz and raw force at 1 kHz, so attempts can be
-  replayed and compared with the sim.
-- **Time the LSTM on the robot computer's CPU.** It must fit well inside the 66 ms step.
+**Check these on the lab computer before the first run:**
+
+```bash
+python3 --version
+python3 -c "import torch; print(torch.__version__)"   # the policy was exported with torch 2.7.0
+pip show frankapy                                      # version / location
+```
+
+TorchScript files from torch 2.7 may not load in older torch; FrankaPy setups often run Python 3.8,
+where the newest torch is 2.4. If loading fails, the policy needs a re-export (ONNX, or TorchScript
+from a matching torch). The FrankaPy calls are all in `FrankaPyArm`, written from FrankaPy's examples
+and Lab2; check them against the installed version.
 
 ### Phase 3: calibration on the robot
 
-1. **Force sign.** Press down on the gripper (or press the held peg onto the table) and read
-   `O_F_ext_hat_K` z. The sim reads **+z** for this press, so set `force_sign` to +1 if the robot
-   also reads positive, and −1 if it reads negative. A wrong sign makes the policy slide *away* from
-   the hole (the flipped stress test shows how badly).
-2. **Hole registration.** Grasp the peg at 32 mm, hand-guide it until it's fully seated, and record
-   the fingertip pose. The hole-rim centre is that x, y, with z = the seated fingertip z − 32 mm +
-   25 mm (rim height above the hole floor). Repeat about 5 times; the spread should be under 0.5 mm.
-3. **Success check** (Factory's definition): the peg's bottom is within 2.5 mm of the hole axis and
-   within 1 mm of the floor. On the robot: fingertip z within 1 mm of the seated z from step 2.
+Commands are `python3 deploy/run_peg.py <command>`. Moving commands need `--ack-safety` and an
+E-stop operator. State (`calibration.json`, `hole.json`, logs) goes to `deploy/runs/`.
+
+1. `check`: read-only. Prints joints, tool and fingertip poses, raw force, gripper width, and whether
+   FrankaPy provides a Jacobian.
+2. `rate-test --export exports/peg_forge_seed2`: holds the current pose while streaming it back.
+   Reports the achieved stream rate, how often the robot state really updates, and the policy's
+   inference time. If the stream rate is well below 120 Hz, lower `--control_hz` and tell me, so
+   the effect can be measured in sim.
+3. `grasp`: closes on the peg (40 N) with the finger ends on the 32 mm line.
+4. `press-test`: lowers the held peg onto a **free flat surface** (not the hole) until the force
+   builds up, and saves `force_sign` so that pressing reads +z, as in sim. Use the robot for this,
+   not your hand: a hand pushing down on the gripper is a force in the opposite direction.
+5. `register-hole`: guide mode, 5 times: seat the peg fully by hand and hold it still. Saves the
+   seated fingertip pose; the rim centre is 7.1 mm below it (32.1 mm grasp − 25 mm depth). The spread
+   should be under 0.5 mm.
+
+**Success** (Factory's definition): the peg's bottom within 2.5 mm of the hole axis and within 1 mm of
+fully seated. The bridge checks the fingertip against the registered seated pose.
 
 ### Phase 4: dry runs, in order of risk
 
-1. **Shadow mode:** the policy runs on real observations, but nothing is sent. Actions should look
-   like sim actions.
-2. **In the air:** the hole estimate is set 5 cm above the real hole. The policy should descend
-   smoothly and stop near the estimate.
-3. **Real insertions** with 0 mm of added error, someone holding the enable switch.
+1. `shadow --export ...`: guide mode; move the peg around above the hole by hand. The policy runs on
+   real observations and prints its targets, but nothing is commanded. Targets should point toward the
+   hole and down.
+2. `run --export ... --air --trials 1`: the estimate is 10 cm above the real hole, so the policy
+   descends toward it and never reaches the boss.
+3. `run --export ... --band 0 0 --trials 3`: real insertions with no added error.
 
-**Safety limits for every run:**
-- Software stop if |force| > 25 N.
-- Bounding box of ±3 cm around the hole, with a z floor.
-- Franka collision thresholds set above the expected 10–15 N contacts, but not disabled.
+**Safety limits** (`SafetyLimits`, checked every tick; a stop ends the attempt and the series):
+- Smoothed, tared force above 25 N.
+- Fingertip more than 4 cm (x or y) from both the hole and the estimate.
+- Fingertip below the seated height minus 3 mm (peg slipped, or wrong hole), or more than 9 cm above
+  the estimate.
+- Speed above 0.3 m/s.
+- Franka's own collision thresholds stay on (franka-interface configuration).
 
 ### Phase 5: evaluation protocol
 
-This mirrors `eval_sweep.py --paper_bins`:
+`run --band MIN MAX --trials 20` mirrors `eval_sweep.py --paper_bins`. Run it for each of the three
+bands, then `summary`:
 
-- **Error:** for each attempt, offset the hole estimate from the registered position by a radius drawn
-  uniformly from the range, in a random 3D direction.
-- **Start pose:** the estimate + (0, 0, 4.7 cm), plus random noise within ±2 cm (x, y), ±1 cm (z) and
-  ±45° yaw. This matches the sim's `hand_init_*` settings.
-- **Size:** 20 attempts per range × 3 ranges = 60 per checkpoint, about 45–60 minutes with automatic
-  retract and reset. Seed 2 first, then seeds 0 and 1.
-- **Report** the same metrics as `results/*.summary.json`, next to the sim numbers.
-- **Optional:** force thresholds of 5 and 10 N.
+- **Error:** the hole estimate is the registered rim plus a radius uniform in the band, in a random 3D
+  direction.
+- **Start pose:** the **registered** rim + (0, 0, 4.7 cm), plus uniform noise of ±2 cm (x, y), ±1 cm
+  (z) and ±45° yaw. As in Factory, the start is relative to the true hole, not the estimate.
+- **Size:** 20 attempts per band × 3 bands = 60 per checkpoint, about 45–60 minutes. Seed 2 first,
+  then seeds 0 and 1.
+- **Report:** `summary` prints success rate, median time, peak force and prediction precision/recall
+  per band, in the same form as `results/*.summary.json`. Per-step logs are in `runs/attempts/`.
+- **Optional:** `--force_threshold 5` and `10`.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Force offset or wrong sign | Tare before each attempt; the press test; the stress evals show the tolerance |
-| Peg slipping in the grasp | Grasping jig; check the seated height after each attempt |
+| Force offset or wrong sign | Robot press test; tare before each attempt; offsets above 1 N cost a lot (stress table); retrain with random offsets if the real estimate drifts |
+| Peg slipping in the grasp | 40 N grasp; the safety floor catches a peg pushed up in the fingers |
 | Real impedance controller ≠ sim controller (the sim also cancels inertia and has a dead zone) | Stiffness stress evals; the sim already randomizes stiffness by ±41% |
+| Stream or state rate too low | `rate-test`; then measure the effect in sim |
+| Policy file won't load on the lab computer | Check the torch version first; re-export |
 | Error in the hole registration | Repeat the hand-guided registration 5 times |
 | Printed parts off-size | Clearance coupon (`../hardware/README.md`); measure and report the actual clearance |

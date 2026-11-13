@@ -82,6 +82,17 @@ def main():
     out["held_asset_height_m"] = u.cfg_task.held_asset_cfg.height
     print(f"[measure] fingertip - held origin (world): {stats(tip_above_held)}")
 
+    # Quaternion sign convention. The policy sees x and y of the fingertip quat (w and z are zeroed),
+    # and those flip with q -> -q, so the robot bridge must pick the same sign (BridgeConfig.quat_ref).
+    q_true, q_obs = u.fingertip_midpoint_quat, u.noisy_fingertip_quat
+    ref = torch.tensor([0.0, 1.0, 0.0, 0.0], device=u.device)  # gripper down, yaw 0
+    out["quat_sign"] = {
+        "true_quat": stats(q_true),
+        "obs_quat": stats(q_obs),
+        "fraction_obs_dot_ref_positive": ((q_obs * ref).sum(1) > 0).float().mean().item(),
+    }
+    print(f"[measure] quat sign: {out['quat_sign']['fraction_obs_dot_ref_positive']:.3f} of envs have obs quat . (0,1,0,0) > 0")
+
     # 3. Press test. Actions are absolute targets around the slot estimate (x 5 cm per unit).
     n = u.num_envs
     mu = torch.zeros((n, 7), device=u.device)

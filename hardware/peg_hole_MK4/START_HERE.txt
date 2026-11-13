@@ -20,6 +20,7 @@ The optional grasp jig is not included; the requested peg, base and coupon are.
 PART DIMENSIONS
 Peg: diameter 7.98; overall length 50.0; both end chamfers 0.5 x 45 degrees.
 Mark a grasp line 32.0 above the bottom after printing. There is no groove.
+The robot grasps with the ENDS of its fingers on this line (pad centres ~9 mm higher).
 Print one peg first, verify it, then print two more for three total.
 
 Base: plate 100 x 100 x 3; boss 24.4 x 24.4, corner radius 7;
