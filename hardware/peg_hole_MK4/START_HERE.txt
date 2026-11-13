@@ -1,0 +1,125 @@
+PEG AND HOLE — ORIGINAL PRUSA MK4 / 0.4 mm / PLA MATTE
+
+STATUS
+CAD files are complete; physical prints have NOT been made or measured.
+This package follows the supplied README. Do not treat a CAD bore size as a
+verified printed diameter. Print the coupon and one peg before choosing a base.
+No G-code or printer-specific 3MF is supplied: slice with your installed MK4 profile.
+
+FILES AND UNITS
+All dimensions are millimetres. Import STL at 100% scale and verify its size.
+- cad_source.py: native, editable parametric CadQuery source (tested with 2.7.0).
+- exports/*.step: exact solid geometry for editing in conventional CAD tools.
+- exports/*.stl: tessellated print meshes, oriented upright with bottom at Z=0.
+- exports/CAD_validation.json: CAD geometry checks, not print measurements.
+- preview.png: geometry preview.
+- MEASUREMENTS.txt: printer details filled in; physical measurements left pending.
+- original_specification.md: supplied README, retained unchanged.
+The optional grasp jig is not included; the requested peg, base and coupon are.
+
+PART DIMENSIONS
+Peg: diameter 7.98; overall length 50.0; both end chamfers 0.5 x 45 degrees.
+Mark a grasp line 32.0 above the bottom after printing. There is no groove.
+Print one peg first, verify it, then print two more for three total.
+
+Base: plate 100 x 100 x 3; boss 24.4 x 24.4, corner radius 7;
+boss height 25 above plate, total base height 28. The blind bore floor is at
+Z=3 and its top is at Z=28. Total depth is 25, including the 0.5 mouth chamfer.
+Straight cylindrical section ends 0.5 below the boss top.
+The bore is perpendicular to the boss top. No outer boss-top chamfer is added.
+Four diameter 6.5 mounting holes have centres at (+/-40, +/-40), i.e. 80 spacing.
+These are OPTIONAL holes for a sacrificial mounting board, not a requirement to
+drill the table. The remaining broad, flat plate can be held with clamps.
+
+Coupon: 80 x 28 x 10, with labelled CAD diameters 9.0 / 9.1 / 9.2 / 9.3.
+Blind holes are 7 deep with a 3 mm floor and a 0.5 x 45 degree mouth chamfer,
+matching the base floor and mouth geometry. Labels are recessed 0.5.
+A short coupon cannot verify the full 25 mm depth of the final base.
+
+NO-DRILL MOUNTING
+A. If the base is near an accessible table edge:
+   Use two spaced screw-operated C-clamps or F-clamps on the outer plate.
+   Each upper jaw presses on a broad protective pad over the plate; each lower
+   jaw bears beneath the tabletop. Use non-marring jaw pads and distribute
+   force so the 3 mm PLA flange does not crack. Keep the plate fully supported
+   against the tabletop; do not bridge a gap or clamp the boss.
+   Check both jaw opening (table + plate + pads) and throat depth (edge to
+   contact point). Keep jaws and clamp bodies outside the full gripper path.
+B. If the target is farther from the edge:
+   Fasten the base to a separate rigid sacrificial board or fixture plate, then
+   clamp that board to the table edge at two or more spaced points. Table
+   drilling is unnecessary. Size and thickness depend on distance and loads.
+   For through-bolts, recess the lower hardware so it cannot rock on or scratch
+   the table. Alternatively use suitable screws into a wooden board through
+   washers, making sure their tips do not protrude underneath.
+   Do not leave a long flexible overhang. Check that the entire fixture cannot
+   slide, twist, or lift under the expected insertion/contact forces.
+Do not rely on foam tape, hook-and-loop, or hot glue as the sole constraint for
+repeatable robot insertion. Attachment rigidity must be verified physically.
+If a board raises the base, update the robot's hole pose accordingly. The boss
+top is board-top + 28 mm. Recheck the pose after remounting.
+If the underside is inaccessible, determine the table construction before
+choosing a different fixture; this design does not assume a magnetic table.
+
+SLICING — STARTING SETTINGS
+Use your exact Original Prusa MK4 / 0.4 mm printer preset.
+Base and coupon: start with 0.15 mm QUALITY @MK4 0.4, Generic PLA.
+Use the same PLA Matte spool, temperatures, extrusion multiplier, perimeter
+settings and XY compensation for coupon and base. Follow the actual spool's
+temperature guidance; a brand-specific temperature is not known here.
+- Base and coupon: 4 perimeters minimum, 40% infill minimum; suggested starting
+  values 4 perimeters, 40% gyroid, 7 top and 7 bottom solid layers.
+- Peg: change layer height to 0.10 mm, 6 perimeters, 100% rectilinear infill,
+  upright with a 5 mm outer brim. This follows the source's 0.10–0.12 range.
+- All parts: no supports. Keep bores and peg axis vertical. Keep scale 100%.
+- Use the manufacturer's suitable first-layer defaults. Inspect the sliced
+  preview for a solid bore floor and uninterrupted bore walls.
+- Start without extra global XY compensation; do not combine a bore-size
+  correction with an additional slicer correction unless recalibrating.
+- Use a consistent seam strategy; inspect and gently remove local seam burrs.
+  Do not sand the entire peg down or enlarge the bore without measuring again.
+The 0.15 profile is a starting point, not a guarantee of +/-0.05 mm accuracy.
+
+CALIBRATION AND PRINT ORDER
+1. Slice and print clearance_coupon_PRINT_FIRST.stl at the base settings.
+2. Separately print one peg at the finer peg settings. Remove its brim carefully.
+3. Measure coupon bores just BELOW the chamfer and 5 mm below the top. The
+   mouth itself is 1.0 mm wider than the cylindrical bore and is not the
+   correct diameter measurement location. Pin gauges are preferable; inside
+   caliper readings at this size are a screening check, not proof of accuracy.
+4. Choose the CAD size whose printed cylindrical bore is 9.00 +/-0.05.
+   Example only: if the hole labelled 9.2 measures 9.00, print the 9p2 base.
+   This example is NOT a prediction for this printer. If none pass, adjust the
+   source and recalibrate; do not select the closest failed size automatically.
+5. Print ONE base_CAD_bore_*_UNCALIBRATED.stl corresponding to that result.
+   UNCALIBRATED means the exported geometry has not itself been physically
+   verified; it does not mean that all four bases should be printed.
+6. Check the finished base bore below the chamfer, at 5 and at 20 mm depth.
+   Ordinary calipers may not reach 20 mm; use suitable gauges or mark it
+   unmeasured. Also measure bore depth, boss height, peg diameter and length.
+7. Aim for nominal bore 9.00 and peg 7.98. Check actual diametral clearance
+   (bore minus peg); the supplied acceptable band is 0.9–1.1 mm. Radial
+   clearance is half the diametral clearance when concentric.
+8. Check by hand for free insertion over the whole depth, with no tight spot,
+   then print the remaining two pegs (and optionally one spare calibrated base).
+   Verify each printed peg. Record the results in MEASUREMENTS.txt.
+A PLA peg will weigh substantially less than the simulated 19 g peg. Measure
+and record its mass; it should not be described as dynamically mass-matched.
+The supplied README allows an 8 x 50 mm steel dowel as an alternative.
+
+EDITING / REGENERATING
+Use a CadQuery Python environment (2.7.0 was used to generate this package).
+  python cad_source.py
+  python cad_source.py --bore 9.16 --peg-diameter 7.98 --out custom_exports
+The second command is a syntax example, not a recommended correction.
+Change PLATE_SIZE or MOUNT_SPACING near the top for a custom mounting layout;
+update expected bounding-box checks if changing the plate dimensions.
+STEP imports retain solids but do not retain a parametric feature history.
+The editable feature definitions are in cad_source.py.
+
+REFERENCE
+User-supplied README is the controlling part specification.
+Prusa layer/perimeter documentation (profile concepts and layer-height limits):
+https://help.prusa3d.com/article/layers-and-perimeters_1748
+Clamp opening and throat-depth definitions:
+https://besseytools.com/en-us/bessey-tools-north-america/support/faqs/faq-clamping-tools

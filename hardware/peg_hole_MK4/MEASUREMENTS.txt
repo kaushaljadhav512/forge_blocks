@@ -1,0 +1,40 @@
+PHYSICAL MEASUREMENT RECORD — PENDING PRINTS
+Do not substitute nominal CAD dimensions for actual measured values.
+
+Printer: Original Prusa MK4
+Nozzle: 0.4 mm
+Filament preset: Generic PLA
+Actual spool: PLA Matte; manufacturer / batch: ______________________
+Base/coupon profile: 0.15 mm QUALITY @MK4 0.4
+Peg proposed layer height: 0.10 mm; actual: _________________________
+Actual first-layer height: _________________________________________
+Perimeters / infill / temperature / compensation: __________________
+Measurement tools and stated accuracy: _____________________________
+
+COUPON — measure below the chamfer, not across the flared mouth
+CAD bore   Just below chamfer (mm)   5 mm down (mm)   Accept?
+9.0        not measured             not measured     pending
+9.1        not measured             not measured     pending
+9.2        not measured             not measured     pending
+9.3        not measured             not measured     pending
+Selected CAD bore size: not yet selected
+
+PEG       D at 10 mm    D at 25 mm    D at 40 mm    Length     Mass (g)
+1         not measured not measured not measured not measured not measured
+2         not measured not measured not measured not measured not measured
+3         not measured not measured not measured not measured not measured
+Take two perpendicular diameter readings at each height to check ovality.
+Grasp mark 32 mm above bottom applied? ______________________________
+
+BASE
+CAD size used for bore (from coupon): not yet selected
+Bore diameter just below top chamfer: not measured
+Bore diameter 5 mm below boss top: not measured
+Bore diameter 20 mm below boss top: not measured
+Bore depth from boss top: not measured
+Boss height above plate: not measured
+Measured diametral clearance for each peg: not measured
+Does each peg drop freely by hand? Any tight spot? not tested
+Clamping arrangement and rigidity check: not tested
+Installed hole pose / fixture board height: not measured
+Photos (parts, bore from above, peg in hole): not yet taken
