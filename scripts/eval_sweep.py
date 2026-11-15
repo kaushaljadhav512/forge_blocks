@@ -39,6 +39,9 @@ parser.add_argument("--action_delay", type=int, default=0, help="apply each acti
 parser.add_argument("--gain_scale", type=float, default=1.0, help="multiply the controller stiffness (before its noise)")
 parser.add_argument("--force_deadband_N", type=float, default=0.0, help="observed force shrinks by this; smaller reads 0")
 parser.add_argument("--force_deadband_mode", choices=["axis", "norm"], default="axis")
+parser.add_argument("--friction_leak_N", type=float, nargs="+", default=[0.0],
+                    help="fake force against the motion: one value (fixed) or LO HI (per episode and axis)")
+parser.add_argument("--friction_leak_v_mm_s", type=float, default=2.0, help="speed where the leak is ~76%% of full size")
 parser.add_argument("--out", required=True, help="per-episode CSV; a .summary.json is written next to it")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -143,6 +146,11 @@ def main():
     env_cfg.obs_rand.ft_force_bias_N = args_cli.force_bias_N
     env_cfg.obs_rand.ft_force_deadband_N = args_cli.force_deadband_N
     env_cfg.obs_rand.ft_force_deadband_mode = args_cli.force_deadband_mode
+    leak = args_cli.friction_leak_N
+    if len(leak) not in (1, 2) or min(leak) < 0 or leak[0] > leak[-1]:
+        sys.exit("--friction_leak_N takes one value or LO HI, both >= 0")
+    env_cfg.obs_rand.ft_force_leak_N = [leak[0], leak[-1]]
+    env_cfg.obs_rand.ft_force_leak_v_mps = args_cli.friction_leak_v_mm_s * 1e-3
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
@@ -226,7 +234,8 @@ def main():
     with open(summary_path, "w") as f:
         stress = {
             k: getattr(args_cli, k)
-            for k in ("force_scale", "force_bias_N", "action_delay", "gain_scale", "force_deadband_N", "force_deadband_mode")
+            for k in ("force_scale", "force_bias_N", "action_delay", "gain_scale", "force_deadband_N", "force_deadband_mode",
+                      "friction_leak_N", "friction_leak_v_mm_s")
         }
         stress["force_threshold"] = args_cli.force_threshold
         json.dump(

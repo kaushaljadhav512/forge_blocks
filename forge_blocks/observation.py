@@ -63,6 +63,16 @@ def sample_radius_error(n: int, radius_range, mode: str, device="cpu") -> torch.
     raise ValueError(f"unknown error mode {mode!r}; expected 'xy' or 'xyz'")
 
 
+def friction_leak(linvel: torch.Tensor, leak_N: torch.Tensor, v_smooth: float) -> torch.Tensor:
+    """Fake force that the real Franka's force estimate shows while the hand moves: joint friction
+    leaking into O_F_ext_hat_K. It opposes the motion on each axis, has size leak_N once the hand
+    moves faster than about v_smooth [m/s], and fades to 0 at rest (tanh: a smoothed Coulomb term).
+
+    In the sim's convention (force on the hand), moving down (v_z < 0) reads +z, like a contact below.
+    """
+    return -leak_N * torch.tanh(linvel / v_smooth)
+
+
 def force_deadband(force: torch.Tensor, deadband: float, mode: str = "axis") -> torch.Tensor:
     """Shrink the observed force toward zero by `deadband` N; anything smaller reads 0.
 

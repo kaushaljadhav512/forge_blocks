@@ -20,22 +20,37 @@
    5 N. With ft_force_deadband_N = d, the observed force shrinks toward zero by d and anything
    smaller reads 0: per component ("axis", loses small sideways forces entirely) or on the
    magnitude ("norm", keeps the direction of what's left).
+
+5. Joint-friction leak (off by default). On the real Franka, moving in free space makes the force
+   estimate read 1.5-2.4 N against the motion (session 1). With ft_force_leak_N = [lo, hi], each
+   episode draws a size per axis from U(lo, hi), and the observed force gets
+   -size * tanh(v / ft_force_leak_v_mps) from the true fingertip velocity v, smoothed like the force.
+   It is added to the raw estimate, before the scale / bias / dead band above. FORGE's actuation
+   dead zone already models the other half of joint friction (the hand moving less than commanded).
 """
 
 import torch
 
 from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
 
-from forge_blocks.observation import force_deadband, noisy_finite_difference, sample_radius_error
+from forge_blocks.observation import force_deadband, friction_leak, noisy_finite_difference, sample_radius_error
 
 
 class ForgeBlocksEnv(ForgeEnv):
     _prev_noisy_pos = None
     _prev_noisy_quat = None
     _force_bias = None
+    _leak_N = None  # (num_envs, 3) per-episode leak size; None while the leak is off
+    _leak_smooth = None
 
     def _compute_intermediate_values(self, dt):
         super()._compute_intermediate_values(dt)
+
+        if self._leak_N is not None:
+            leak = friction_leak(self.fingertip_midpoint_linvel, self._leak_N, self.cfg.obs_rand.ft_force_leak_v_mps)
+            alpha = self.cfg.ft_smoothing_factor  # the same EMA ForgeEnv applies to the sensed force
+            self._leak_smooth = alpha * leak + (1 - alpha) * self._leak_smooth
+            self.noisy_force = self.noisy_force + self._leak_smooth
 
         scale = getattr(self.cfg.obs_rand, "ft_force_scale", 1.0)
         if scale != 1.0:
@@ -68,6 +83,16 @@ class ForgeBlocksEnv(ForgeEnv):
                 self._force_bias = torch.zeros((self.num_envs, 3), device=self.device)
             direction = torch.randn((len(env_ids), 3), device=self.device)
             self._force_bias[env_ids] = bias_n * direction / torch.linalg.norm(direction, dim=1, keepdim=True)
+
+        leak_lo, leak_hi = getattr(self.cfg.obs_rand, "ft_force_leak_N", [0.0, 0.0])
+        if leak_hi > 0.0:
+            if self._leak_N is None:
+                self._leak_N = torch.zeros((self.num_envs, 3), device=self.device)
+                self._leak_smooth = torch.zeros((self.num_envs, 3), device=self.device)
+            self._leak_N[env_ids] = leak_lo + (leak_hi - leak_lo) * torch.rand((len(env_ids), 3), device=self.device)
+            # The reset just moved the hand; start the new episode's smoothed leak from 0, as ForgeEnv
+            # does for the force.
+            self._leak_smooth[env_ids] = 0.0
 
         mode = getattr(self.cfg.obs_rand, "error_radius_mode", "gaussian")
         if mode == "gaussian":

@@ -45,6 +45,10 @@ class BlockObsRandCfg(ForgeObsRandCfg):
     ft_force_bias_N: float = 0.0
     ft_force_deadband_N: float = 0.0
     ft_force_deadband_mode: str = "axis"
+    # Joint-friction leak into the force estimate (see block_env.py): per-episode, per-axis size
+    # range in N, and the speed in m/s at which it reaches ~76% of that size (tanh(1)).
+    ft_force_leak_N: list = [0.0, 0.0]
+    ft_force_leak_v_mps: float = 0.002
 
 
 @configclass

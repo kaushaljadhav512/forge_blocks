@@ -147,6 +147,65 @@ class TestForgeBlocksEnv(unittest.TestCase):
         env.randomize_initial_state(torch.tensor([0]))
         self.assertAlmostEqual(torch.linalg.norm(env.init_fixed_pos_obs_noise[0]).item(), 0.01, places=6)
 
+    def _leak_env(self, leak_N, alpha=1.0):
+        env = self.env
+        env.num_envs = 1
+        env.cfg.ft_smoothing_factor = alpha
+        env.cfg.obs_rand.ft_force_leak_N = leak_N
+        env.cfg.obs_rand.ft_force_leak_v_mps = 0.002
+        env.fingertip_midpoint_linvel = torch.zeros(1, 3)
+        env.noisy_force = torch.zeros(1, 3)
+        orig = env._compute_intermediate_values
+
+        def compute(dt):  # the stub has no force pipeline: start each call from a zero sensed force
+            env.noisy_force = torch.zeros(1, 3)
+            orig(dt)
+
+        env._compute_intermediate_values = compute
+        compute(DT)  # randomize_initial_state needs a noisy pose to remember
+        return env
+
+    def test_leak_is_off_by_default(self):
+        env = self._leak_env([0.0, 0.0])
+        env.randomize_initial_state(torch.tensor([0]))
+        env.fingertip_midpoint_linvel = torch.tensor([[0.0, 0.0, -0.01]])
+        env._compute_intermediate_values(DT)
+        self.assertEqual(env.noisy_force.abs().max().item(), 0.0)
+
+    def test_leak_opposes_motion_and_vanishes_at_rest(self):
+        env = self._leak_env([2.0, 2.0])
+        env.randomize_initial_state(torch.tensor([0]))
+        env.fingertip_midpoint_linvel = torch.tensor([[0.02, 0.0, -0.02]])  # 20 mm/s: tanh(10) ~ 1
+        env._compute_intermediate_values(DT)
+        torch.testing.assert_close(env.noisy_force, torch.tensor([[-2.0, 0.0, 2.0]]), atol=1e-4, rtol=0)
+        env.fingertip_midpoint_linvel = torch.zeros(1, 3)
+        env._compute_intermediate_values(DT)
+        self.assertEqual(env.noisy_force.abs().max().item(), 0.0)
+
+    def test_leak_is_smoothed_and_reset(self):
+        env = self._leak_env([2.0, 2.0], alpha=0.25)
+        env.randomize_initial_state(torch.tensor([0]))
+        env.fingertip_midpoint_linvel = torch.tensor([[0.0, 0.0, -0.02]])
+        env._compute_intermediate_values(DT)
+        self.assertAlmostEqual(env.noisy_force[0, 2].item(), 0.5, places=4)  # 0.25 * 2 N
+        for _ in range(60):
+            env._compute_intermediate_values(DT)
+        self.assertAlmostEqual(env.noisy_force[0, 2].item(), 2.0, places=3)
+        env.randomize_initial_state(torch.tensor([0]))
+        self.assertEqual(env._leak_smooth.abs().max().item(), 0.0)
+
+    def test_leak_size_is_drawn_per_axis_in_range(self):
+        env = self._leak_env([1.0, 3.0])
+        sizes = []
+        for _ in range(200):
+            env.randomize_initial_state(torch.tensor([0]))
+            sizes.append(env._leak_N.clone())
+        sizes = torch.cat(sizes)
+        self.assertGreaterEqual(sizes.min().item(), 1.0)
+        self.assertLessEqual(sizes.max().item(), 3.0)
+        self.assertAlmostEqual(sizes.mean().item(), 2.0, delta=0.1)
+        self.assertFalse(torch.equal(sizes[:, 0], sizes[:, 1]))  # independent axes
+
 
 @unittest.skipIf(torch is None, "needs torch")
 class TestSampleRadiusError(unittest.TestCase):
@@ -173,6 +232,16 @@ class TestSampleRadiusError(unittest.TestCase):
     def test_unknown_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             self.sample(1, [0.0, 0.01], "z")
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class TestFrictionLeak(unittest.TestCase):
+    def test_shape(self):
+        from forge_blocks.observation import friction_leak
+
+        v = torch.tensor([[0.002, -0.05, 0.0]])
+        out = friction_leak(v, torch.tensor([[2.0, 2.0, 2.0]]), 0.002)
+        torch.testing.assert_close(out, torch.tensor([[-2.0 * math.tanh(1.0), 2.0, 0.0]]), atol=1e-5, rtol=0)
 
 
 @unittest.skipIf(torch is None, "needs torch")
