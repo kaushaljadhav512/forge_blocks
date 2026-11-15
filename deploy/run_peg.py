@@ -14,6 +14,7 @@
     run_peg.py friction-breakaway --ack-safety         free space: pull needed to start moving, 6 directions
     run_peg.py friction-sweep --axis x --ack-safety    free space: friction and fake force vs speed, 3 cm and back
     run_peg.py friction-steps --ack-safety             free space: how far policy-sized target steps get
+    run_peg.py friction-walk --seed 0 --ack-safety     free space: seeded random walk over the hole area, 3 min
     run_peg.py register-hole --ack-safety              hand-guide into the hole 5x -> hole.json
     run_peg.py shadow --export EXPORT                  guide mode; policy runs but commands nothing
     run_peg.py run --export EXPORT --air --trials 1 --ack-safety          estimate 10 cm high: no contact
@@ -76,10 +77,18 @@ def save_check(d, name, out):
     path = Path(d) / f"{name}_{stamp}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(out, indent=2))
-    summary = {k: v for k, v in out.items() if k != "rows"}
+    # time series stay in the raw file only
+    summary = {k: v for k, v in out.items() if k not in ("rows", "joints") and not k.endswith("series")}
     save_calib(d, **{name: summary})
     log_event(Path(d) / "events.jsonl", event=name, file=path.name, **summary)
     print("saved", path)
+
+
+def friction_force_sign(calib):
+    """Sign for the friction checks' force readings, so they print the force on the hand as the policy sees
+    it. The cold walk (runbook 2.1a) runs before 2.2's press-test re-check, so without a calibration this is
+    session 1's -1. The raw estimate is saved either way."""
+    return float(calib.get("force_sign", -1.0))
 
 
 def bridge_cfg(args, calib):
@@ -141,6 +150,15 @@ def main(argv=None):
     a.add_argument("--axes", default="xyz")
     a.add_argument("--stiffness_scale", type=float, default=1.0,
                    help="all six gains x this (0.7-1.3, the range the sim stress evals covered)")
+    a = add("friction-walk", moves=True)
+    a.add_argument("--seed", type=int, default=0, help="same seed, same walk: repeat it cold and warm, replay it in sim")
+    a.add_argument("--seconds", type=float, default=180.0)
+    a.add_argument("--max_speed", type=float, default=20.0, help="mm/s")
+    a.add_argument("--centre", type=float, nargs=3, help="fingertip, base frame (default: above hole.json's rim, "
+                   f"else {fb.WALK_CENTRE})")
+    a.add_argument("--box", type=float, nargs=6, metavar=("XLO", "YLO", "ZLO", "XHI", "YHI", "ZHI"),
+                   help=f"fingertip bounds, base frame (default {fb.WALK_BOX_LO} {fb.WALK_BOX_HI})")
+    a.add_argument("--label", default="", help="e.g. cold, warm: added to the file name")
     a = add("register-hole", moves=True)
     a.add_argument("--n", type=int, default=5)
     a = add("shadow", export=True)
@@ -279,7 +297,7 @@ def main(argv=None):
         if not 0.0 < args.max_N <= 8.0:
             raise SystemExit("--max_N must be in (0, 8]")
         confirm("Peg grasped, in free space, at least 10 cm clear in EVERY direction, nothing touching it?")
-        out = fb.friction_breakaway(arm, cfg, max_pull_N=args.max_N)
+        out = fb.friction_breakaway(arm, cfg, max_pull_N=args.max_N, force_sign=friction_force_sign(calib))
         print("direction   breakaway pull (N)   estimate along it at the peak (N)")
         for r in out["rows"]:
             b = f"{r['breakaway_N']:6.2f}" if r["breakaway_N"] is not None else f">{r['max_pull_N']:5.1f} (no motion)"
@@ -295,7 +313,7 @@ def main(argv=None):
         confirm(f"Peg grasped, in free space, at least {args.sweep_mm / 10 + 5:.0f} cm clear along +{args.axis} "
                 f"and 10 cm everywhere else, nothing touching it?")
         out = fb.friction_sweep(arm, cfg, axis=args.axis, speeds_m_s=[v / 1000 for v in args.speeds],
-                                sweep_m=args.sweep_mm / 1000)
+                                sweep_m=args.sweep_mm / 1000, force_sign=friction_force_sign(calib))
         i = "xyz".index(args.axis)
         print("speed (mm/s)   friction (N)   fake force along (N)   fake across (N)   pose error (N/cm)")
         for r in out["rows"]:
@@ -303,7 +321,7 @@ def main(argv=None):
                   f"              {r['fake_across_N']:6.2f}           {r['pose_error_N_per_cm'][i]:6.3f}")
         b = out["viscous_N_per_m_s"]
         print(f"fit: F = Fc + b*v, Fc = {out['coulomb_N']:.2f} N, b = " + ("n/a (one speed)" if b is None else f"{b:.0f} N/(m/s)"))
-        print("fake force along: < 0 opposes the motion. sim budget: under ~1 N of offset costs a few points; 2 N costs 7-20")
+        print(f"force_sign {out['force_sign']:+g}; fake force along: < 0 opposes the motion. sim budget: under ~1 N of offset costs a few points; 2 N costs 7-20")
         out["table"] = [{k: r[k] for k in r if k not in ("series", "joints")} for r in out["rows"]]
         save_check(args.dir, f"friction_sweep_{args.axis}", out)
         return 0
@@ -329,6 +347,45 @@ def main(argv=None):
         out["table"] = [{k: r[k] for k in r if k not in ("series", "joints")} for r in out["rows"]]
         save_check(args.dir, "friction_steps" if args.stiffness_scale == 1.0 else f"friction_steps_k{args.stiffness_scale:g}", out)
         return 0
+
+    if args.cmd == "friction-walk":
+        lo, hi = (tuple(args.box[:3]), tuple(args.box[3:])) if args.box else (fb.WALK_BOX_LO, fb.WALK_BOX_HI)
+        centre = fb.WALK_CENTRE
+        if args.centre:
+            centre = tuple(args.centre)
+        elif (args.dir / "hole.json").exists():
+            rim = fb.Hole.load(args.dir / "hole.json").rim
+            centre = (float(rim[0]), float(rim[1]), fb.WALK_CENTRE[2])
+        spec = fb.WalkSpec(seed=args.seed, duration_s=args.seconds, box_lo=lo, box_hi=hi, centre=centre,
+                           speed_mm_s=(1.0, args.max_speed))
+        try:
+            spec.check()
+        except ValueError as e:
+            raise SystemExit(str(e))
+        size = 100 * (np.array(hi) - np.array(lo))
+        peg_z = 100 * (np.array([lo[2], hi[2]]) - fb.GRASP_TIP_ABOVE_PEG_BOTTOM)
+        print(f"Walk area: {size[0]:.0f} cm (x) by {size[1]:.0f} cm (y), x {100 * lo[0]:.0f}-{100 * hi[0]:.0f} cm in front of the "
+              f"base, peg bottom {peg_z[0]:.0f}-{peg_z[1]:.0f} cm above the table; centre {np.round(centre, 3).tolist()}.")
+        print("From `home` (or anywhere above the area, in front of the robot), the peg first moves across at its "
+              "height to above the centre, then straight down to it.")
+        confirm("Peg grasped, gripper pointing down, nothing in the area or on the way there, and clamps and hole "
+                "base below the peg's lowest point?")
+        force_sign = friction_force_sign(calib)
+        out = fb.friction_walk(arm, cfg, spec, force_sign=force_sign)
+        print(f"walked {out['seconds_done']:.0f} of {out['planned_s']:.0f} s, {len(out['series'])} states"
+              + (f"; STOPPED: {out['stopped']}" if out["stopped"] else ""))
+        fit = out["fit"]
+        if fit:
+            print(f"leak fit (force_sign {force_sign:+g}; v_s = {fit['v_s_mm_s']:g} mm/s, the sim uses 2): "
+                  "fake force opposing the motion, per axis (> 0: opposes it, as in the sim)")
+            print("axis   moving + (N)   moving - (N)   residual (N)   without friction terms (N)")
+            for ax, r in fit["axes"].items():
+                print(f"  {ax}       {r['leak_plus_N']:6.2f}         {r['leak_minus_N']:6.2f}         {r['rms_N']:5.2f}"
+                      f"          {r['rms_no_friction_N']:5.2f}")
+            print("sim training range: 0-3 N per axis")
+        label = f"_{args.label}" if args.label else ""
+        save_check(args.dir, f"friction_walk_s{args.seed}{label}", out)
+        return 0 if not out["stopped"] else 1
 
     if args.cmd == "register-hole":
         confirm("Hole base clamped? Peg grasped at the 32 mm line?")

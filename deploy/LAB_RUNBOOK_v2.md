@@ -24,9 +24,10 @@ controller. Each test below gives one number that model needs.
 | 2.6 Pose repeat | Whether the friction changes between the hole height and higher up | whether one model is enough |
 | 2.3a / 2.6 `force-drift` (hold only) | Drift of the force estimate while holding still, at both poses (session 1: one run, one pose) | sim force-offset risk: needs well under 1 N over an attempt |
 | 2.7 Stiffness × 1.3 | Whether a stiffer spring shrinks the stuck zone (sim: ±30% stiffness is harmless) | cheapest fix to try first |
+| 2.1a / 2.5a / 2.7a `friction-walk` | The same 3-min random walk over the hole area, cold, mid-session and warm: the force estimate's error during policy-like motion, and how much it changes between repeats | sim leak range (fit printed per run); a sim replay of the same walk checks the sim's leak model |
 
 There are two sessions:
-- **Session 2 (about 1.5 h): friction measurements, no insertions.** Then send the results back.
+- **Session 2 (about 1 h 50 min): friction measurements, no insertions.** Then send the results back.
 - **Session 3 (about 2 h): insertions**, with whatever fix session 2 leads to. This is v1's "Session 2".
 
 > **Safety, every time.** Same as v1: two people, one on the **E-stop** whenever the arm can move;
@@ -42,17 +43,18 @@ There are two sessions:
 
 ## 0. Before you go to the lab
 
-**Code.** Use `main` (the `lukas` fixes are merged into it). On the **host**, not in the container:
+**Code.** Use the `lukas` branch (`friction-walk` and the joint logging are only there). On the **host**,
+not in the container:
 
 ```bash
 cd forge_blocks
-git checkout main && git pull
+git checkout lukas && git pull
 git status                     # must be clean: the lab copy must not have local edits
 git log --oneline -1           # write down the commit
 ```
 
 > **Check the friction commands are there.** In the container, `python3 deploy/run_peg.py --help` must
-> list `friction-breakaway`, `friction-sweep` and `friction-steps`. If they are missing, the pull didn't
+> list `friction-breakaway`, `friction-sweep`, `friction-steps` and `friction-walk`. If they are missing, the pull didn't
 > get the new code: **don't go**, because without them this session only repeats session 1.
 
 > **Check the joint torques reach the logs (not yet verified on the robot).** The friction commands
@@ -107,8 +109,43 @@ python3 deploy/run_peg.py grasp --ack-safety
 
 - [ ] `check`: angle under about 5°, each raw force axis under 3 N, `state source: topic`.
 - [ ] Grasp width **6.3–6.4 mm**, and the peg doesn't wiggle.
+- [ ] When was the robot (the arm, not the PC) switched on today? ______ (friction changes as the joints warm up)
 
 If the hole base was moved since session 1, clamp it again as in v1 §1.5.
+
+### 2.1a Random walk, cold
+
+Do this **first**, while the joints are still cold. The peg wanders for 3 min over the area around the hole,
+the way a policy moves: random directions, 1–20 mm/s, stops, reversals and 0.5–8 mm jumps. In free space the
+true force is zero, so everything the estimate reads is error. **The same `--seed` makes exactly the same
+motion every time**: we repeat it later to see how much the friction changes, and replay it in sim.
+
+The walk area is the box from Lab2's MuJoCo scene, in the robot base frame (fingertip ≈ finger ends):
+
+| | Range | In the room |
+|---|---|---|
+| x | 0.40–0.68 m | 40–68 cm in front of the base; the hole is at about 59 cm |
+| y | ±0.15 m | 15 cm either side of the centre line, well inside the shelves |
+| z | 0.12–0.30 m | **peg bottom 9–27 cm above the table**, at least 6 cm above the hole base |
+
+It mostly stays near its centre, low and above the hole. **Check the clamp handles**: if anything sticks up
+more than about 8 cm above the table inside that area, move it or stop here and report it.
+
+Start it from `home`. The walk gets into its area by itself: the peg moves **across at home height** to
+above the centre (about 28 cm forward), then **straight down** to it (about 34 cm), at 5 cm/s, tares there,
+then walks. Nothing in the Lab2 scene is on that path; check nothing in the room is either. It refuses to
+start unless the gripper points down and the peg is in front of the robot between the area and home height.
+
+```bash
+python3 deploy/run_peg.py home --ack-safety
+python3 deploy/run_peg.py friction-walk --seed 0 --label cold --ack-safety
+```
+
+It stops on its own, keeping what it recorded, if the force goes over 10 N or the peg leaves the area by
+2 cm. At the end it prints a fit of the sim's friction model to the run: the fake force opposing the motion
+per axis and direction, and how much of the error that explains. Write the fit in the table at 2.7a.
+
+- [ ] The walk ran the full 180 s (no `STOPPED`). Motion looked smooth? Any stick-slip, noises: ______
 
 ### 2.2 Force sign (quick re-check)
 
@@ -145,16 +182,19 @@ python3 deploy/run_peg.py force-drift --seconds 30 --sweep_m 0 --ack-safety
 | hold: drift (N/s) | < 0.03 | | |
 | stream start shift | (just record it) | 0.3–0.6 N | |
 
-Then the breakaway test:
+Then the breakaway test, **three times** in a row (stiction varies from one try to the next, so one try
+says little). Each run saves its own file:
 
 ```bash
+python3 deploy/run_peg.py friction-breakaway --ack-safety
+python3 deploy/run_peg.py friction-breakaway --ack-safety
 python3 deploy/run_peg.py friction-breakaway --ack-safety
 ```
 
 | Direction | +x | −x | +y | −y | +z (up) | −z (down) |
 |---|---|---|---|---|---|---|
-| Breakaway pull (N) | | | | | | |
-| Force estimate at breakaway (N) | | | | | | |
+| Breakaway pull, run 1 / 2 / 3 (N) | | | | | | |
+| Force estimate at breakaway, run 1 (N) | | | | | | |
 
 Session 1 rough value: ~2 N in z.
 
@@ -205,6 +245,18 @@ python3 deploy/run_peg.py friction-steps --steps_mm 0.5 1 2 4 8 --ack-safety
 9.0 mm bore), and a success needs the peg within 2.5 mm of the axis. If the arm stops more than ~1 mm
 short at 2–4 mm steps, the policy can't position the peg precisely.
 
+### 2.5a Random walk, mid-session, twice
+
+The same walk as 2.1a, now that the joints have been moving for a while, and then **straight away again**.
+Two runs back to back show the short-term spread; comparing with 2.1a shows the warm-up. Start from `home`
+again, as in 2.1a (the second walk starts where the first one ended, inside the area). About 7 min.
+
+```bash
+python3 deploy/run_peg.py home --ack-safety
+python3 deploy/run_peg.py friction-walk --seed 0 --label mid --ack-safety
+python3 deploy/run_peg.py friction-walk --seed 0 --label mid2 --ack-safety
+```
+
 ### 2.6 Pose repeat: at the hole height
 
 Joint friction depends on the arm's posture, and session 1's at-rest force changed with pose (0.6 N
@@ -246,6 +298,31 @@ python3 deploy/run_peg.py friction-steps --steps_mm 0.5 1 2 4 8 --stiffness_scal
 |---|---|---|---|---|---|
 | Worst axis: distance moved after 1.5 s, × 1.3 (mm) | | | | | |
 
+### 2.7a Random walk, warm, and a second walk
+
+The last repeat of the seed-0 walk, then one **different** walk (seed 1). The sim's friction model is fitted
+on one walk and checked on the other, so a fit that only matches one trajectory shows up. Start from `home`,
+as in 2.1a. About 7 min.
+
+```bash
+python3 deploy/run_peg.py home --ack-safety
+python3 deploy/run_peg.py friction-walk --seed 0 --label warm --ack-safety
+python3 deploy/run_peg.py friction-walk --seed 1 --label warm --ack-safety
+```
+
+From the fit each walk prints: fake force opposing the motion (N), moving + / moving −, and the residual.
+
+| Walk | x + / − | y + / − | z + / − | residual x / y / z (N) | time since robot on |
+|---|---|---|---|---|---|
+| 2.1a seed 0 cold | | | | | |
+| 2.5a seed 0 mid | | | | | |
+| 2.5a seed 0 mid2 | | | | | |
+| 2.7a seed 0 warm | | | | | |
+| 2.7a seed 1 warm | | | | | |
+
+The sim trains with 0–3 N per axis. A +/− difference smaller than the spread between the seed-0 repeats
+isn't real (the fit has no stiction, which can fake a difference of up to ~0.5 N).
+
 ### 2.8 Register the hole
 
 As in v1 §1.8 (skipped in session 1). With the peg still grasped:
@@ -275,6 +352,7 @@ we've looked at the numbers. What happens next:
 | Result | Plan |
 |---|---|
 | Drift hold over 1 N at either pose (2.3a, 2.6) | Report it first: offset is the biggest sim risk, and it must be fixed before anything else |
+| Walk fits (2.7a) above 3 N on any axis, or very different between repeats | Widen the sim's leak range (or model the change) before relying on a retrained policy |
 | Steps reach within ~1 mm at 2 mm (2.5), and sideways fake force under ~1 N (2.4) | Session 3 with the current policy |
 | Stiffness × 1.3 fixes the steps (2.7), and fake force under ~1 N | Session 3 with stiffness × 1.3 (the sim says it's harmless) |
 | Otherwise | Retrain with the measured friction (Fc, b, stiction, fake force) in the sim, and/or add friction compensation to the controller; then session 3 |
@@ -369,6 +447,14 @@ Commands, output files and troubleshooting are the same as in v1 (see its "Quick
 | `force-drift --sweep_m 0` | holds still | v1's drift test with the sweep skipped |
 | `friction-steps --steps_mm ...` | up to 8 mm steps, free space | Distance reached and time to 63% for policy-sized steps → `friction_steps_*.json` |
 | `--stiffness_scale S` (on `friction-steps`) | | Runs the steps with all six gains × S; only 0.7–1.3 is accepted (the range the sim covered) |
+| `friction-walk --seed N --label L` | 3 min over a 28 × 30 × 18 cm box above the hole, free space | Seeded random walk; records target, fingertip, force and joints at 100 Hz and prints a fit of the sim's leak model → `friction_walk_sN_L_*.json` |
 
-All three stop with a safety stop if the tared force goes over 10 N or the hand gets more than 5 cm from
-where the check started. A safety stop here means something touched the peg: check the clearance.
+The first three stop with a safety stop if the tared force goes over 10 N or the hand gets more than 5 cm
+from where the check started. `friction-walk` stops (keeping its data, and leaving the arm where it is) if
+the force goes over 10 N or the fingertip leaves its box by 2 cm; it refuses to start with the fingertip
+outside the area it can start from (run `home` first). A stop on force means something touched the peg: check
+the clearance.
+
+The friction commands print the force estimate as the **force on the hand** (`force_sign` from
+`calibration.json`, else session 1's −1), as the sim and the policy see it: friction holding the hand back
+reads **< 0 along the motion**. The saved series keep the raw estimate.

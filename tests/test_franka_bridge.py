@@ -6,6 +6,7 @@ force can be sign-flipped and biased like libfranka's estimate. This checks the 
 (frames, tare, sign, rates, success detection, safety, streaming lifecycle), not policy quality.
 """
 
+import json
 import math
 import os
 import sys
@@ -25,7 +26,7 @@ RIM = np.array([0.59, 0.0, 0.028])
 class FakeArm:
     def __init__(self, raw_sign=1.0, bias=(0.0, 0.0, 0.0), tau=0.1, R=fb.DOWN, spike_at=None, sense_deadband=0.0,
                  act_deadband=0.0, drift=(0.0, 0.0, 0.0), z_gain=(0.0, 0.0, 0.0), stream_shift=(0.0, 0.0, 0.0),
-                 fric_coulomb=0.0, fric_static=None, fric_leak=0.0, pos_gain=None):
+                 fric_coulomb=0.0, fric_static=None, fric_leak=0.0, pos_gain=None, vel_leak=None):
         # Joint friction (per Cartesian axis, off unless fric_coulomb or fric_static is set): the hand
         # stays put until the spring pull exceeds fric_static, then moves at (pull - fric_coulomb) /
         # damping, and sticks again when the pull drops to fric_coulomb. damping = 565 * tau, so with no
@@ -34,6 +35,8 @@ class FakeArm:
         self.fric_coulomb = fric_coulomb
         self.fric_static = fric_coulomb if fric_static is None else fric_static
         self.fric_leak = fric_leak
+        self.vel_leak = vel_leak  # (F, v_s): the sim's model, -F tanh(v / v_s) per axis on the tip velocity
+        self.tip_vel = np.zeros(3)
         self.friction = fric_coulomb > 0 or self.fric_static > 0
         self.damping = 565.0 * tau
         self.k = np.full(3, 565.0)  # set from start_stream's stiffness
@@ -70,12 +73,14 @@ class FakeArm:
 
     def _advance(self, dt):
         self.t += dt
+        before = self.tip.copy()
         self.fric_force = np.zeros(3)
         if self.target is not None and self.friction:
             self._advance_friction(dt)
         elif self.target is not None:
             self.tip = self.tip + (self.target - self.tip) * min(1.0, dt / self.tau)
         self.tip[2] = max(self.tip[2], self._floor_tip_z(self.tip))
+        self.tip_vel = (self.tip - before) / dt
 
     def _advance_friction(self, dt):
         gap = self.target - self.tip
@@ -112,6 +117,8 @@ class FakeArm:
         if self.streaming:
             f = f + self.stream_shift
         f = f + self.fric_leak * self.fric_force
+        if self.vel_leak is not None:
+            f = f - self.vel_leak[0] * np.tanh(self.tip_vel / self.vel_leak[1])
         if self.pos_gain is not None:
             f = f + self.pos_gain @ (self.tip - self.p0)
         if self.spike_at is not None and self.t > self.spike_at:
@@ -391,6 +398,27 @@ class TestCalibration(unittest.TestCase):
             self.assertLess(r["fake_across_N"], 0.05)
         self.assertAlmostEqual(out["pose_error_N_per_cm"][0], 0.2, delta=0.02)
 
+    def test_friction_checks_read_the_force_on_the_hand_for_either_raw_sign(self):
+        class FlippedArm(FakeArm):  # raw estimate with the lab robot's sign (force_sign -1)
+            def read(self):
+                st = super().read()
+                st.force = -st.force
+                return st
+
+        kw = dict(fric_coulomb=2.0, fric_leak=0.8)
+        cfg = fb.BridgeConfig(tare_s=0.05)
+        a, b = FakeArm(**kw), FlippedArm(**kw)
+        sa = fb.friction_sweep(a, cfg, axis="x", speeds_m_s=(0.01,), clock=a.clock, sleep=a.sleep)
+        sb = fb.friction_sweep(b, cfg, axis="x", speeds_m_s=(0.01,), force_sign=-1.0, clock=b.clock, sleep=b.sleep)
+        self.assertAlmostEqual(sb["rows"][0]["fake_along_N"], sa["rows"][0]["fake_along_N"], places=6)
+        self.assertLess(sb["rows"][0]["fake_along_N"], -1.0)  # opposes the motion
+        a, b = FakeArm(fric_static=2.0, fric_coulomb=1.5), FlippedArm(fric_static=2.0, fric_coulomb=1.5, fric_leak=1.0)
+        a.fric_leak = 1.0
+        ba = fb.friction_breakaway(a, cfg, directions=("+x",), ramp_m_s=0.004, clock=a.clock, sleep=a.sleep)
+        bb = fb.friction_breakaway(b, cfg, directions=("+x",), ramp_m_s=0.004, force_sign=-1.0, clock=b.clock, sleep=b.sleep)
+        self.assertAlmostEqual(bb["rows"][0]["est_along_N"], ba["rows"][0]["est_along_N"], places=6)
+        self.assertLess(bb["rows"][0]["est_along_N"], 0.0)
+
     def test_friction_sweep_stops_on_force(self):
         arm = FakeArm(spike_at=1.5)
         with self.assertRaises(fb.SafetyStop):
@@ -601,6 +629,142 @@ class TestCalibration(unittest.TestCase):
         hole = fb.Hole(seated_tip=[0.5, 0.0, 0.035], samples=[[0.5, 0.0, 0.035], [0.5004, 0.0, 0.035]])
         np.testing.assert_allclose(hole.rim, [0.5, 0.0, 0.035 - fb.SEATED_TIP_ABOVE_RIM])
         self.assertAlmostEqual(hole.spread_m, 0.0002, places=9)
+
+
+class TestFrictionWalk(unittest.TestCase):
+    SPEC = dict(seed=3, duration_s=40.0)
+
+    def walk_arm(self, **kw):
+        arm = FakeArm(**kw)
+        arm.goto(fb.tip_to_tool(np.array([0.5, 0.05, 0.2]), fb.DOWN), fb.DOWN, 0.1)  # inside the box
+        return arm
+
+    def test_trajectory_is_seeded_and_stays_in_the_box(self):
+        spec = fb.WalkSpec(**self.SPEC)
+        a, b = fb.walk_trajectory(spec), fb.walk_trajectory(fb.WalkSpec(**self.SPEC))
+        np.testing.assert_array_equal(a["target"], b["target"])
+        c = fb.walk_trajectory(fb.WalkSpec(seed=4, duration_s=40.0))
+        self.assertFalse(np.allclose(a["target"][: len(c["target"])][-100:], c["target"][: len(a["target"])][-100:]))
+        tgt = a["target"]
+        self.assertTrue((tgt >= np.array(spec.box_lo) - 1e-12).all() and (tgt <= np.array(spec.box_hi) + 1e-12).all())
+        np.testing.assert_allclose(tgt[0], spec.centre)
+        self.assertGreaterEqual(a["t"][-1], spec.duration_s - spec.dt)
+        self.assertEqual(set(a["kind"].tolist()), set(fb.WALK_KINDS.values()))
+        moving = a["kind"] == fb.WALK_KINDS["move"]
+        speed = np.linalg.norm(np.diff(tgt, axis=0), axis=1) / spec.dt
+        self.assertLessEqual(speed[moving[1:] & moving[:-1]].max(), spec.speed_mm_s[1] / 1000 + 1e-6)
+        jumps = speed[a["kind"][1:] == fb.WALK_KINDS["step"]] * spec.dt
+        self.assertLessEqual(jumps.max(), spec.step_mm[1] / 1000 + 1e-9)
+        long = fb.walk_trajectory(fb.WalkSpec(seed=0, duration_s=600.0))["target"]
+        self.assertLess(np.abs(long.mean(axis=0) - np.array(spec.centre)).max(), 0.04)  # pulled toward the centre
+
+    def test_spec_refuses_boxes_beyond_the_table(self):
+        with self.assertRaises(ValueError):
+            fb.WalkSpec(box_lo=(0.40, -0.30, 0.12)).check()  # into the shelves
+        with self.assertRaises(ValueError):
+            fb.WalkSpec(box_lo=(0.40, -0.15, 0.02)).check()  # down to the table
+        with self.assertRaises(ValueError):
+            fb.WalkSpec(centre=(0.30, 0.0, 0.14)).check()  # centre outside the box
+
+    def test_walk_recovers_the_sim_leak_model(self):
+        arm = self.walk_arm(vel_leak=(1.5, 0.002))
+        out = fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), fb.WalkSpec(**self.SPEC),
+                               clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+        self.assertIsNone(out["stopped"])
+        self.assertAlmostEqual(out["seconds_done"], out["planned_s"], delta=0.05)
+        self.assertEqual(len(out["series"][0]), len(fb.WALK_COLUMNS))
+        self.assertEqual(len(out["joints"]), len(out["series"]))
+        self.assertEqual(out["fit"]["v_s_mm_s"], 2.0)
+        for ax, r in out["fit"]["axes"].items():
+            for side in ("leak_plus_N", "leak_minus_N"):
+                self.assertAlmostEqual(r[side], 1.5, delta=0.1, msg=f"{ax} {side}")
+            self.assertLess(r["rms_N"], 0.3 * r["rms_no_friction_N"])
+
+    def test_walk_fit_uses_the_force_sign(self):
+        arm = self.walk_arm(vel_leak=(1.5, 0.002))
+        out = fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), fb.WalkSpec(**self.SPEC),
+                               clock=arm.clock, sleep=arm.sleep)
+        flipped = [r[:7] + [-x for x in r[7:10]] + r[10:] for r in out["series"]]  # a robot whose raw sign is -1
+        fit = fb.fit_walk_leak(flipped, force_sign=-1.0)
+        for ax in "xyz":
+            self.assertAlmostEqual(fit["axes"][ax]["leak_plus_N"], out["fit"]["axes"][ax]["leak_plus_N"], places=6)
+        self.assertLess(fb.fit_walk_leak(flipped)["axes"]["x"]["leak_plus_N"], -1.0)  # wrong sign: reads as negative
+
+    def test_walk_with_stiction_reads_a_smaller_leak(self):
+        # Coulomb friction that also holds a force at rest after the hand sticks (0.8 x 1.5 = 1.2 N while
+        # moving, up to that at rest). The tanh model has no term for the force at rest: over 3 min seeds 0-3
+        # give 0.9-1.6 N per side, and the two sides of this symmetric fake differ by up to 0.5 N. The robot
+        # may do this too, so compare repeats before reading a +/- difference as real.
+        arm = self.walk_arm(fric_coulomb=1.5, fric_leak=0.8)
+        out = fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), fb.WalkSpec(seed=3, duration_s=180.0),
+                               clock=arm.clock, sleep=arm.sleep)
+        for ax, r in out["fit"]["axes"].items():
+            for side in ("leak_plus_N", "leak_minus_N"):
+                self.assertTrue(0.7 < r[side] < 1.7, msg=f"{ax} {side}: {r[side]}")
+            self.assertLess(r["rms_N"], r["rms_no_friction_N"])
+
+    def test_walk_without_friction_finds_pose_error_only(self):
+        gain = np.zeros((3, 3))
+        gain[2, 0] = 10.0  # 0.1 N per cm of x shows up in z
+        arm = self.walk_arm(pos_gain=gain)
+        out = fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), fb.WalkSpec(**self.SPEC),
+                               clock=arm.clock, sleep=arm.sleep)
+        for ax, r in out["fit"]["axes"].items():
+            self.assertLess(abs(r["leak_plus_N"]) + abs(r["leak_minus_N"]), 0.1, msg=ax)
+        self.assertAlmostEqual(out["fit"]["axes"]["z"]["pose_N_per_cm"][0], 0.1, delta=0.01)
+
+    def test_walk_stops_on_contact_and_keeps_its_data(self):
+        arm = self.walk_arm(spike_at=9.0)  # the walk starts after ~6.7 s: two gotos + tare
+        out = fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), fb.WalkSpec(**self.SPEC),
+                               clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+        self.assertIn("force", out["stopped"])
+        self.assertGreater(len(out["series"]), 100)
+        self.assertLess(out["seconds_done"], 10.0)
+
+    def test_walk_refuses_to_start_outside_the_box(self):
+        arm = FakeArm()  # starts 4.7 cm above the rim, below the box
+        with self.assertRaises(fb.HardwareError):
+            fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), fb.WalkSpec(**self.SPEC), clock=arm.clock, sleep=arm.sleep)
+        self.assertEqual(arm.streams, 0)
+        tilted = np.array([[1.0, 0.0, 0.0], [0.0, -math.cos(0.35), -math.sin(0.35)], [0.0, math.sin(0.35), -math.cos(0.35)]])
+        arm = self.walk_arm()
+        arm.R = tilted @ np.eye(3)  # 20 deg from gripper-down
+        with self.assertRaises(fb.HardwareError):
+            fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), fb.WalkSpec(**self.SPEC), clock=arm.clock, sleep=arm.sleep)
+        self.assertEqual(arm.streams, 0)
+
+    def test_walk_starts_from_home(self):
+        arm = FakeArm()
+        home_tip = np.array([0.31, 0.0, 0.48])  # FrankaPy's reset_joints pose
+        arm.goto(fb.tip_to_tool(home_tip, fb.DOWN), fb.DOWN, 0.1)
+        gotos = []
+        goto = arm.goto
+        arm.goto = lambda pos, R, duration, stiffness=None: (gotos.append(fb.tool_to_tip(pos, R)), goto(pos, R, duration))
+        spec = fb.WalkSpec(seed=0, duration_s=2.0)
+        out = fb.friction_walk(arm, fb.BridgeConfig(tare_s=0.05), spec, clock=arm.clock, sleep=arm.sleep)
+        np.testing.assert_allclose(gotos[0], [spec.centre[0], spec.centre[1], 0.48], atol=1e-9)  # across, at home height
+        np.testing.assert_allclose(gotos[1], spec.centre, atol=1e-9)  # then down
+        self.assertEqual(len(out["approach"]), 2)
+        self.assertIsNone(out["stopped"])
+        self.assertIsNone(fb.walk_approach([0.31, 0.30, 0.48], spec))  # beside the shelves
+        self.assertIsNone(fb.walk_approach([0.31, 0.0, 0.70], spec))  # above the corridor
+        self.assertEqual(len(fb.walk_approach(spec.centre, spec)), 1)
+
+    def test_save_check_keeps_time_series_out_of_calibration(self):
+        import tempfile
+        from pathlib import Path
+
+        import run_peg
+
+        with tempfile.TemporaryDirectory() as d:
+            run_peg.save_check(d, "friction_walk_s0", {"fit": {"v_s_mm_s": 2.0}, "series": [[0.0]], "joints": [[0.0]],
+                                                       "hold_series": [[1.0]], "rows": [1]})
+            calib = json.loads((Path(d) / "calibration.json").read_text())["friction_walk_s0"]
+            self.assertEqual(set(calib), {"fit"})
+            raw = json.loads(next(Path(d).glob("friction_walk_s0_*.json")).read_text())
+            self.assertIn("series", raw)
 
 
 if __name__ == "__main__":

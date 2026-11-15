@@ -1049,10 +1049,13 @@ def _move_free(arm, cfg, a, b, R, tare, home, speed_m_s, clock, sleep, record=No
 
 
 def friction_breakaway(arm, cfg: BridgeConfig, directions=("+x", "-x", "+y", "-y", "+z", "-z"), ramp_m_s=0.0005,
-                       moved_m=0.0005, max_pull_N=8.0, settle_s=1.0, clock=time.monotonic, sleep=time.sleep):
+                       moved_m=0.0005, max_pull_N=8.0, settle_s=1.0, force_sign=1.0, clock=time.monotonic,
+                       sleep=time.sleep):
     """Stiction. For each direction, move the target away from the hand slowly (0.5 mm/s: the spring
     pull grows by 0.28 N/s at 565 N/m) until the hand has moved `moved_m`. The breakaway force is the
-    largest pull before that (just before it slips). Gives up at max_pull_N. Then the target returns."""
+    largest pull before that (just before it slips). Gives up at max_pull_N. Then the target returns.
+    est_along_N / est_N are force_sign x the tared estimate: the force on the hand, as the sim and the policy
+    see it (friction holding the hand back reads < 0 along the pull). The series keeps the raw estimate."""
     st = arm.read()
     home, R = st.tool_pos.copy(), st.tool_R.copy()
     per_dir = settle_s + 2 * (max_pull_N / min(cfg.stiffness[:3]) + moved_m) / ramp_m_s + 2.0
@@ -1088,8 +1091,8 @@ def friction_breakaway(arm, cfg: BridgeConfig, directions=("+x", "-x", "+y", "-y
                 "direction": name,
                 "breakaway_N": float(peak) if broke else None,
                 "max_pull_N": float(peak),
-                "est_along_N": float(peak_f @ d),  # tared estimate at the peak, along the pull direction
-                "est_N": peak_f.tolist(),
+                "est_along_N": float(force_sign * peak_f @ d),  # force on the hand at the peak, along the pull
+                "est_N": (force_sign * peak_f).tolist(),
                 "series": series,  # t, target offset, moved, pull, fx, fy, fz
                 "joints": joints.rows,  # columns: joint_columns
             })
@@ -1098,12 +1101,13 @@ def friction_breakaway(arm, cfg: BridgeConfig, directions=("+x", "-x", "+y", "-y
         arm.stop_stream()
         arm.goto(home, R, 3.0)
     return {"ramp_mm_s": 1000 * ramp_m_s, "moved_mm": 1000 * moved_m, "max_pull_N": max_pull_N,
-            "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(), "joint_columns": JOINT_LOG_COLUMNS,
+            "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(), "force_sign": force_sign,
+            "joint_columns": JOINT_LOG_COLUMNS,
             "rows": rows}
 
 
 def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0.01, 0.02), sweep_m=0.03,
-                   settle_s=0.5, steady=(0.35, 0.95), clock=time.monotonic, sleep=time.sleep):
+                   settle_s=0.5, steady=(0.35, 0.95), force_sign=1.0, clock=time.monotonic, sleep=time.sleep):
     """Kinetic friction and what it does to the force estimate. For each speed, the target moves
     sweep_m along +axis and back at that speed. On the steady part of each stroke (the `steady`
     fraction of the target's path), fit, for the pull and for each axis of the tared estimate:
@@ -1114,7 +1118,9 @@ def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0
     friction (in the pull: the friction force; in the estimate: the fake force it adds) and g is the
     pose-dependent error. Across speeds, friction = Fc + b * speed. b includes the controller's damping, so
     read Fc, not b, as joint friction. The steady window skips the start of each stroke, where the hand
-    first sticks and then catches up."""
+    first sticks and then catches up. The fit uses force_sign x the tared estimate, the force on the hand as
+    the sim and the policy see it, so a fake force opposing the motion is < 0 whatever the robot's raw sign
+    (the lab robot's is -1). The series keeps the raw estimate."""
     e = AXES[axis]
     i = "xyz".index(axis)
     k = float(cfg.stiffness[i])
@@ -1143,7 +1149,7 @@ def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0
                     series.append([round(sgn), round(t, 4), round(prog, 4), round(pos, 6), round(pull, 4)]
                                   + [round(float(x), 4) for x in f])
                     if steady[0] <= prog <= steady[1]:
-                        pts.append([pos, sgn, pull, *f])
+                        pts.append([pos, sgn, pull, *(force_sign * f)])
             P = np.array(pts)
             if len(P) < 4 or len(set(P[:, 1])) < 2:
                 raise HardwareError("too few steady samples; lower the speed or raise --control_hz")
@@ -1165,7 +1171,7 @@ def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0
         arm.stop_stream()
         arm.goto(home, R, 3.0)
     out = {"axis": axis, "sweep_mm": 1000 * sweep_m, "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(),
-           "joint_columns": JOINT_LOG_COLUMNS, "rows": rows}
+           "force_sign": force_sign, "joint_columns": JOINT_LOG_COLUMNS, "rows": rows}
     sp = np.array([r["speed_mm_s"] / 1000 for r in rows])
     fr = np.array([r["friction_N"] for r in rows])
     if len(rows) >= 2 and np.ptp(sp) > 0:
@@ -1215,3 +1221,246 @@ def friction_steps(arm, cfg: BridgeConfig, steps_m=(0.0005, 0.001, 0.002, 0.004,
         arm.goto(home, R, 3.0)
     return {"stiffness": list(cfg.stiffness), "hold_s": hold_s, "tare_N": tare.tolist(),
             "joint_columns": JOINT_LOG_COLUMNS, "rows": rows}
+
+
+# --- Friction random walk (session 2) -------------------------------------------------------------
+#
+# The checks above move along one axis at a time, at constant speeds, at one or two poses. The walk moves
+# the target through the region the policy works in the way a policy does: random directions and speeds,
+# stops, reversals and policy-sized jumps. In free space the true force is zero, so every reading is
+# estimate error (friction leak + pose-dependent error). The trajectory is a pure function of WalkSpec
+# (seeded), so the same walk can be repeated on the robot (cold / warm) and replayed in sim.
+#
+# Region: Lab2's MuJoCo scene (Robot_Autonomy_Lab/Lab2/franka_emika_panda/panda_torque_table_shelves.xml),
+# robot base frame. Table top z ≈ 0, x 0.185-0.735, y ±0.504. Shelf bottom boards start at |y| = 0.279
+# (x 0.095-0.60; posts at |y| 0.41-0.46 up to z 0.65). Hole spot (0.59, 0), boss top z ≈ 0.028. The box
+# bounds the sim fingertip point (≈ finger ends; the peg bottom is GRASP_TIP_ABOVE_PEG_BOTTOM lower):
+# - |y| <= 0.15: the hand is ~0.2 m wide along y (fingers open along y with DOWN), so ~3 cm from the boards.
+# - z >= 0.12: peg bottom >= 0.088, 6 cm above the boss top; clamp handles may stick up, check them.
+# - x 0.40-0.68: inside the table (edge 0.735) and in top-down reach (Lab2 picks at 0.59).
+WALK_BOX_LO = (0.40, -0.15, 0.12)
+WALK_BOX_HI = (0.68, 0.15, 0.30)
+WALK_LIMIT_LO = (0.30, -0.20, 0.08)  # no --box may go beyond these
+WALK_LIMIT_HI = (0.70, 0.20, 0.40)
+WALK_CENTRE = (0.59, 0.0, 0.14)  # above the hole spot, low: where the policy works
+WALK_STOP_MARGIN_M = 0.02  # the hand may lag outside the box by this much before the walk stops
+# Where the walk may start from: the corridor in front of the robot above the table, up to 0.60 m. Nothing in
+# the Lab2 scene is there (the shelf arches at |y| 0.44 are at z 0.65), and FrankaPy's home pose (fingertip
+# ≈ (0.31, 0, 0.48)) is inside it. The box itself is inside it too.
+WALK_APPROACH_LO = (0.25, -0.15)
+WALK_APPROACH_HI = (0.70, 0.15)
+WALK_APPROACH_Z_MAX = 0.60
+WALK_APPROACH_M_S = 0.05
+WALK_MAX_TILT_DEG = 10.0  # the walk runs gripper-down at yaw 0 (DOWN), like the sim replay
+WALK_KINDS = {"hold": 0, "move": 1, "step": 2}
+
+
+@dataclass
+class WalkSpec:
+    seed: int = 0
+    duration_s: float = 180.0
+    box_lo: tuple = WALK_BOX_LO
+    box_hi: tuple = WALK_BOX_HI
+    centre: tuple = WALK_CENTRE
+    spread_m: tuple = (0.06, 0.06, 0.04)  # std of move waypoints around the centre (then clipped to the box)
+    speed_mm_s: tuple = (1.0, 20.0)  # log-uniform per move
+    max_move_s: float = 8.0  # a slow move toward a far waypoint stops after this long
+    p_hold: float = 0.2
+    p_step: float = 0.2
+    hold_s: tuple = (0.3, 2.0)
+    step_mm: tuple = (0.5, 8.0)  # log-uniform jump along one axis, like friction-steps
+    step_hold_s: float = 1.0
+    dt: float = 0.005
+
+    def check(self):
+        lo, hi, c = (np.array(v, dtype=float) for v in (self.box_lo, self.box_hi, self.centre))
+        if (lo < np.array(WALK_LIMIT_LO) - 1e-9).any() or (hi > np.array(WALK_LIMIT_HI) + 1e-9).any() or (lo >= hi).any():
+            raise ValueError(f"walk box must lie within {WALK_LIMIT_LO}..{WALK_LIMIT_HI} (Lab2 table, clear of the shelves)")
+        if (c < lo).any() or (c > hi).any():
+            raise ValueError("walk centre must be inside the box")
+        if not 0.0 < self.duration_s <= 600.0 or not 0.0 < self.speed_mm_s[0] <= self.speed_mm_s[1] <= 30.0:
+            raise ValueError("duration must be in (0, 600] s and speeds in (0, 30] mm/s")
+        return self
+
+
+def walk_trajectory(spec: WalkSpec) -> dict:
+    """Fingertip targets for a seeded random walk: t [s], target (N, 3) [m], kind (N,) (WALK_KINDS).
+
+    Segments, until duration_s: hold (the target stays put), move (straight line at a constant speed to a
+    waypoint drawn around the centre, which pulls the walk back toward it), step (the target jumps 0.5-8 mm
+    along one axis and holds). Starts at the centre; never leaves the box (it is convex, waypoints are clipped)."""
+    spec.check()
+    rng = np.random.default_rng(spec.seed)
+    lo, hi, c = (np.array(v, dtype=float) for v in (spec.box_lo, spec.box_hi, spec.centre))
+    p, t = c.copy(), 0.0
+    segs = []  # (kind, t_start, duration, start, end)
+    while t < spec.duration_s:
+        u = rng.random()
+        if u < spec.p_hold:
+            dur, end, kind = rng.uniform(*spec.hold_s), p.copy(), "hold"
+        elif u < spec.p_hold + spec.p_step:
+            size = math.exp(rng.uniform(*np.log(spec.step_mm))) / 1000.0
+            end = p.copy()
+            ax = rng.integers(3)
+            end[ax] += rng.choice([-1.0, 1.0]) * size
+            end = np.clip(end, lo, hi)
+            dur, kind = spec.step_hold_s, "step"
+        else:
+            w = np.clip(c + rng.normal(0.0, spec.spread_m), lo, hi)
+            v = math.exp(rng.uniform(*np.log(spec.speed_mm_s))) / 1000.0
+            d = np.linalg.norm(w - p)
+            if d / v > spec.max_move_s:
+                w = p + (w - p) * (v * spec.max_move_s / d)
+            dur, end, kind = max(np.linalg.norm(w - p) / v, spec.dt), w, "move"
+        segs.append((kind, t, dur, p, end))
+        p, t = end, t + dur
+    ts = np.arange(0.0, t, spec.dt)
+    target, kinds = np.zeros((len(ts), 3)), np.zeros(len(ts), dtype=int)
+    starts = np.array([s[1] for s in segs])
+    idx = np.searchsorted(starts, ts, side="right") - 1
+    for j, (kind, t0, dur, a, b) in enumerate(segs):
+        sel = idx == j
+        if kind == "move":
+            s = np.clip((ts[sel] - t0) / dur, 0.0, 1.0)[:, None]
+            target[sel] = a + s * (b - a)
+        else:
+            target[sel] = b  # hold: b == a; step: the jump happens at the segment's start
+        kinds[sel] = WALK_KINDS[kind]
+    return {"t": ts, "target": target, "kind": kinds}
+
+
+def walk_approach(tip0, spec: WalkSpec):
+    """Fingertip waypoints from tip0 to the walk's start: across at the current height to above the start,
+    then straight down (or up). Only from inside the approach corridor (or the box); None from anywhere else."""
+    lo = np.minimum(np.array(WALK_APPROACH_LO), np.array(spec.box_lo[:2]))
+    hi = np.maximum(np.array(WALK_APPROACH_HI), np.array(spec.box_hi[:2]))
+    tip0 = np.asarray(tip0, dtype=float)
+    if (tip0[:2] < lo).any() or (tip0[:2] > hi).any() or not spec.box_lo[2] <= tip0[2] <= WALK_APPROACH_Z_MAX:
+        return None
+    start = np.array(spec.centre, dtype=float)
+    across = np.array([start[0], start[1], tip0[2]])
+    return [across, start] if np.linalg.norm(across - tip0) > 0.005 else [start]
+
+
+def tilt_from_down_deg(R) -> float:
+    return float(np.degrees(np.arccos(np.clip((np.trace(DOWN.T @ np.asarray(R)) - 1) / 2, -1.0, 1.0))))
+
+
+WALK_COLUMNS = ["t", "target_x", "target_y", "target_z", "tip_x", "tip_y", "tip_z", "fx", "fy", "fz", "kind"]
+
+
+def friction_walk(arm, cfg: BridgeConfig, spec: WalkSpec, force_sign=1.0, max_force_N=FRICTION_MAX_FORCE_N,
+                  clock=time.monotonic, sleep=time.sleep) -> dict:
+    """Run a seeded random walk (walk_trajectory) in free space and record, per new robot state, the target,
+    the fingertip, the tared force estimate and the joint state. The hand may start anywhere in the approach
+    corridor, e.g. at FrankaPy's home pose, gripper down within WALK_MAX_TILT_DEG: it moves (FrankaPy goto)
+    across at its height to above the start, then down to it (walk_approach), and tares there. The walk ends
+    early, keeping its data, if the force passes max_force_N (something touches the peg: the arm then stays
+    where it is) or the hand leaves the box by WALK_STOP_MARGIN_M. The series keeps the raw (tared) estimate;
+    fit_walk_leak's result, included, uses force_sign x raw, the sim's convention (force on the hand)."""
+    traj = walk_trajectory(spec)
+    lo, hi = np.array(spec.box_lo), np.array(spec.box_hi)
+    st = arm.read()
+    tilt = tilt_from_down_deg(st.tool_R)
+    if tilt > WALK_MAX_TILT_DEG:
+        raise HardwareError(f"gripper is {tilt:.0f} deg from pointing down at yaw 0; run `home` first")
+    R = DOWN.copy()
+    tip0 = tool_to_tip(st.tool_pos, st.tool_R, cfg.tip_offset)
+    path = walk_approach(tip0, spec)
+    if path is None:
+        raise HardwareError(f"fingertip {np.round(tip0, 3).tolist()} is outside the area the walk can start from "
+                            f"(x {WALK_APPROACH_LO[0]}-{WALK_APPROACH_HI[0]}, |y| <= {WALK_APPROACH_HI[1]}, "
+                            f"z {spec.box_lo[2]}-{WALK_APPROACH_Z_MAX}); run `home` first")
+    prev = tip0
+    for wp in path:
+        arm.goto(tip_to_tool(wp, R, cfg.tip_offset), R, max(3.0, float(np.linalg.norm(wp - prev)) / WALK_APPROACH_M_S))
+        prev = wp
+    start_tool = tip_to_tool(traj["target"][0], R, cfg.tip_offset)
+    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=spec.duration_s + 30.0)
+    series, joints, stopped, last_t = [], JointLog(), None, None
+    t_end = float(traj["t"][-1])
+    try:
+        tare = stream_tare(arm, start_tool, R, cfg, clock, sleep)
+        t0 = clock()
+        while (t := clock() - t0) < t_end:
+            i = min(int(t / spec.dt), len(traj["t"]) - 1)
+            j = min(i + 1, len(traj["t"]) - 1)
+            a = (t - traj["t"][i]) / spec.dt if j > i else 0.0
+            target = traj["target"][i] + min(max(a, 0.0), 1.0) * (traj["target"][j] - traj["target"][i])
+            st = arm.read()
+            f = st.force - tare
+            tip = tool_to_tip(st.tool_pos, R, cfg.tip_offset)
+            if st.t != last_t:
+                last_t = st.t
+                series.append([round(t, 4)] + [round(float(x), 6) for x in (*target, *tip)]
+                              + [round(float(x), 4) for x in f] + [int(traj["kind"][i])])
+                joints.add(t, st)
+            if np.linalg.norm(f) > max_force_N:
+                stopped = f"force {np.linalg.norm(f):.1f} N in free space at t = {t:.1f} s; is something touching the peg?"
+                break
+            if (tip < lo - WALK_STOP_MARGIN_M).any() or (tip > hi + WALK_STOP_MARGIN_M).any():
+                stopped = f"fingertip {np.round(tip, 3).tolist()} left the walk box at t = {t:.1f} s"
+                break
+            arm.send_target(tip_to_tool(target, R, cfg.tip_offset), R)
+            sleep(1.0 / cfg.control_hz)
+    finally:
+        arm.stop_stream()
+    out = {"spec": asdict(spec), "stiffness": list(cfg.stiffness), "tare_N": tare.tolist(), "R": R.tolist(),
+           "approach": [wp.tolist() for wp in path],
+           "tip_offset": cfg.tip_offset, "force_sign": force_sign, "stopped": stopped, "seconds_done": series[-1][0] if series else 0.0,
+           "planned_s": t_end, "columns": WALK_COLUMNS, "series": series,
+           "joint_columns": JOINT_LOG_COLUMNS, "joints": joints.rows}
+    if series:
+        tips = np.array([r[4:7] for r in series])
+        out["tip_min"], out["tip_max"] = tips.min(axis=0).tolist(), tips.max(axis=0).tolist()
+    out["fit"] = fit_walk_leak(series, force_sign=force_sign) if len(series) >= 200 else None
+    return out
+
+
+def fit_walk_leak(series, force_sign=1.0, v_s_mm_s=(0.5, 1.0, 2.0, 5.0, 10.0), smooth_s=0.05) -> dict:
+    """Fit the sim's friction-leak model to a walk (rows as WALK_COLUMNS). f = force_sign x the raw tared
+    estimate, i.e. the force on the hand as the sim and the policy see it. Per axis i, by least squares:
+
+        f_i = c_i + g_i . (tip - mean tip) - F+_i tanh(max(v_i, 0) / v_s) - F-_i tanh(min(v_i, 0) / v_s)
+
+    v = fingertip velocity (central differences of the fingertip, smoothed over smooth_s). F+/F- > 0 is a
+    force opposing the motion, as in the sim's friction_leak(-F tanh(v / v_s)); separate signs because
+    session 1 read ~2 N moving down and ~1 N moving up. g is the pose-dependent error (N/m). v_s is shared
+    by the three axes (the sim has one), picked from v_s_mm_s by the smallest total residual. Also reports
+    the residual with no friction terms, so the gain from the friction model is visible.
+
+    The model has no stiction. With friction that also holds a force at rest (the fake arm's Coulomb mode),
+    3-min walks give the moving leak to about ±0.3 N, and a symmetric friction shows up to 0.5 N of +/-
+    difference: compare repeats before reading an asymmetry as real (tests: TestFrictionWalk)."""
+    S = np.array([r[:10] for r in series], dtype=float)
+    t, tip, f = S[:, 0], S[:, 4:7], force_sign * S[:, 7:10]
+    dt = float(np.median(np.diff(t)))
+    k = max(1, int(round(smooth_s / dt)))
+    sm = np.column_stack([np.convolve(tip[:, i], np.ones(k) / k, mode="same") for i in range(3)])
+    v = np.column_stack([np.gradient(sm[:, i], t) for i in range(3)])
+    n = len(t)
+    keep = slice(k, n - k)  # the moving average is biased at the ends
+    X = tip - tip.mean(axis=0)
+    base = np.column_stack([np.ones(n), X])
+    no_fric = [float(np.sqrt(np.mean((f[keep, i] - base[keep] @ np.linalg.lstsq(base[keep], f[keep, i], rcond=None)[0]) ** 2)))
+               for i in range(3)]
+    best = None
+    per_vs = {}
+    for vs in v_s_mm_s:
+        coefs, rms = [], []
+        for i in range(3):
+            A = np.column_stack([base, np.tanh(np.maximum(v[:, i], 0) / (vs / 1000)), np.tanh(np.minimum(v[:, i], 0) / (vs / 1000))])
+            c = np.linalg.lstsq(A[keep], f[keep, i], rcond=None)[0]
+            coefs.append(c)
+            rms.append(float(np.sqrt(np.mean((f[keep, i] - A[keep] @ c) ** 2))))
+        per_vs[vs] = float(np.sqrt(np.mean(np.square(rms))))
+        if best is None or per_vs[vs] < per_vs[best[0]]:
+            best = (vs, coefs, rms)
+    vs, coefs, rms = best
+    axes = {}
+    for i, name in enumerate("xyz"):
+        c = coefs[i]
+        axes[name] = {"leak_plus_N": float(-c[4]), "leak_minus_N": float(-c[5]), "offset_N": float(c[0]),
+                      "pose_N_per_cm": (c[1:4] / 100.0).tolist(), "rms_N": rms[i], "rms_no_friction_N": no_fric[i]}
+    return {"v_s_mm_s": vs, "rms_by_v_s": per_vs, "speed_max_mm_s": (1000 * np.abs(v[keep]).max(axis=0)).tolist(),
+            "axes": axes}
