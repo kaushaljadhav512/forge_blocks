@@ -421,6 +421,37 @@ class TestCalibration(unittest.TestCase):
             self.assertAlmostEqual(r["moved_mm"], 2.0, delta=0.01)
             self.assertAlmostEqual(r["t63_ms"], 100, delta=15)  # tau = 100 ms
 
+    def test_joint_log_keeps_one_row_per_state(self):
+        log = fb.JointLog()
+        st = fb.RobotState(t=1.0, q=np.arange(7.0), dq=np.zeros(7), tool_pos=np.zeros(3), tool_R=np.eye(3),
+                           force=np.zeros(3), tau_J=np.ones(7))
+        log.add(0.0, st)
+        log.add(0.005, st)  # the 200 Hz loop reads the same 100 Hz message twice
+        self.assertEqual(len(log.rows), 1)
+        row = log.rows[0]
+        self.assertEqual(len(row), len(fb.JOINT_LOG_COLUMNS))
+        self.assertEqual(row[1:8], list(range(7)))
+        self.assertEqual(row[15:22], [1.0] * 7)
+        self.assertEqual(row[22:], [None] * 7)  # no tau_ext from this source
+
+    def test_friction_checks_log_joints(self):
+        cfg = fb.BridgeConfig(tare_s=0.05)
+        arm = FakeArm(fric_static=2.0, fric_coulomb=1.5)
+        outs = [
+            fb.friction_breakaway(arm, cfg, directions=("+x",), ramp_m_s=0.004, clock=arm.clock, sleep=arm.sleep),
+            fb.friction_sweep(arm, cfg, axis="y", speeds_m_s=(0.02,), clock=arm.clock, sleep=arm.sleep),
+            fb.friction_steps(arm, cfg, steps_m=(0.004,), axes="z", hold_s=0.5, clock=arm.clock, sleep=arm.sleep),
+        ]
+        for out in outs:
+            self.assertEqual(out["joint_columns"], fb.JOINT_LOG_COLUMNS)
+            for r in out["rows"]:
+                self.assertGreater(len(r["joints"]), 10)
+                self.assertTrue(all(len(j) == 29 for j in r["joints"]))
+                t = [j[0] for j in r["joints"]]
+                self.assertEqual(t, sorted(t))
+        sweep = outs[1]["rows"][0]["joints"]
+        self.assertGreater(sweep[-1][0], 2 * 0.03 / 0.02)  # covers both strokes, out and back
+
     def test_rate_test_reports_step_latency(self):
         arm = FakeArm(tau=0.05)
         out = fb.rate_test(arm, fb.BridgeConfig(), seconds=0.5, clock=arm.clock, sleep=arm.sleep)
@@ -472,6 +503,8 @@ class TestCalibration(unittest.TestCase):
 
         msg_in = Msg()
         msg_in.O_T_EE, msg_in.q, msg_in.dq, msg_in.O_F_ext_hat_K = tuple(B.T.reshape(-1)), tuple(q), tuple(dq), tuple(ft)
+        tau_J, tau_ext = np.linspace(-3.0, 3.0, 7), np.linspace(0.1, 0.7, 7)
+        msg_in.tau_J, msg_in.tau_ext_hat_filtered = tuple(tau_J), tuple(tau_ext)
 
         def make(fa, source):
             arm = fb.FrankaPyArm.__new__(fb.FrankaPyArm)  # skip __init__: it imports rospy and frankapy
@@ -497,6 +530,15 @@ class TestCalibration(unittest.TestCase):
             np.testing.assert_allclose(st.dq, dq, err_msg=name)
             np.testing.assert_allclose(st.force, ft[:3], err_msg=name)
             self.assertEqual(st.J.shape, (6, 7))
+        # Joint torques come only with the topic; the service paths leave them empty.
+        np.testing.assert_allclose(states["topic"].tau_J, tau_J)
+        np.testing.assert_allclose(states["topic"].tau_ext, tau_ext)
+        for name in ("get_robot_state", "separate calls"):
+            self.assertIsNone(states[name].tau_J, name)
+            self.assertIsNone(states[name].tau_ext, name)
+        del msg_in.tau_ext_hat_filtered  # an older message without the field still reads
+        topic_arm._on_state(msg_in)
+        self.assertIsNone(topic_arm.read().tau_ext)
 
         # Two reads of one message share its arrival time; a silent topic is a safety stop.
         self.assertEqual(topic_arm.read().t, topic_arm.read().t)

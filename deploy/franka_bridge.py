@@ -126,6 +126,8 @@ class RobotState:
     tool_R: np.ndarray
     force: np.ndarray  # O_F_ext_hat_K[:3], base-frame axes, raw (no sign flip, no tare)
     J: np.ndarray | None = None  # 6x7 tool-point Jacobian [v; w], if available
+    tau_J: np.ndarray | None = None  # measured joint torques [Nm] (libfranka tau_J), topic only
+    tau_ext: np.ndarray | None = None  # estimated external joint torques [Nm] (tau_ext_hat_filtered), topic only
 
     def check(self):
         parts = [self.q, self.dq, self.tool_pos, self.tool_R, self.force]
@@ -228,15 +230,18 @@ class FrankaPyArm:
                 raise SafetyStop(f"robot state is {1000 * age:.0f} ms old; {ROBOT_STATE_TOPIC} stopped publishing?")
             T = np.asarray(msg.O_T_EE, dtype=float).reshape(4, 4).T @ self._tool_delta  # as FrankaPy's utils
             q, dq, ft = msg.q, msg.dq, msg.O_F_ext_hat_K
+            tau_J, tau_ext = getattr(msg, "tau_J", None), getattr(msg, "tau_ext_hat_filtered", None)
         elif self.has_robot_state:
             t = time.monotonic()
             s = fa.get_robot_state()
             T = np.asarray(s["pose"].matrix, dtype=float) @ self._tool_delta
             q, dq, ft = s["joints"], s["joint_velocities"], s["ee_force_torque"]
+            tau_J, tau_ext = None, None
         else:
             t = time.monotonic()
             T = np.asarray(fa.get_pose().matrix, dtype=float)  # get_pose() already includes the tool delta
             q, dq, ft = fa.get_joints(), fa.get_joint_velocities(), fa.get_ee_force_torque()
+            tau_J, tau_ext = None, None
         q = np.asarray(q, dtype=float)
         J = np.asarray(fa.get_jacobian(q), dtype=float) if self.has_jacobian else None  # local, no request
         return RobotState(
@@ -247,6 +252,8 @@ class FrankaPyArm:
             tool_R=T[:3, :3].copy(),
             force=np.asarray(ft, dtype=float)[:3],
             J=J if J is not None and J.shape == (6, 7) else None,
+            tau_J=_joint_vector(tau_J),
+            tau_ext=_joint_vector(tau_ext),
         ).check()
 
     def compare_with_service(self) -> dict:
@@ -974,6 +981,36 @@ FRICTION_MAX_FORCE_N = 10.0  # free space: a tared reading above this means some
 FRICTION_MAX_TRAVEL_M = 0.05  # the hand never goes further than this from where the check started
 
 
+JOINT_LOG_COLUMNS = ["t"] + [f"{name}{j}" for name in ("q", "dq", "tau_J", "tau_ext") for j in range(1, 8)]
+
+
+class JointLog:
+    """Joint state alongside a friction check, so a per-joint friction model (e.g. Gaz et al. 2019) can be
+    fitted later without another lab session. One row per new robot state (100 Hz on the topic; the
+    control loop's repeated reads of the same message are skipped): t since the check's start, q [rad],
+    dq [rad/s], tau_J and tau_ext [Nm] (None where the state source doesn't provide them)."""
+
+    def __init__(self):
+        self.rows = []
+        self._last_t = None
+
+    def add(self, t_rel, st):
+        if st.t == self._last_t:
+            return
+        self._last_t = st.t
+        row = [round(float(t_rel), 4)]
+        for v, digits in ((st.q, 5), (st.dq, 5), (st.tau_J, 4), (st.tau_ext, 4)):
+            row += [None] * 7 if v is None else [round(float(x), digits) for x in v]
+        self.rows.append(row)
+
+
+def _joint_vector(v):
+    if v is None:
+        return None
+    v = np.asarray(v, dtype=float)
+    return v if v.shape == (7,) and np.isfinite(v).all() else None
+
+
 def _free_tick(arm, cfg: BridgeConfig, target_tool, R, tare, home, sleep, max_force_N=FRICTION_MAX_FORCE_N,
                max_travel_m=FRICTION_MAX_TRAVEL_M):
     """One control tick in free space: read, check, send the target, sleep. Returns (state, tared force)."""
@@ -1028,11 +1065,13 @@ def friction_breakaway(arm, cfg: BridgeConfig, directions=("+x", "-x", "+y", "-y
             k = float(cfg.stiffness["xyz".index(name[1])])
             p0 = _hold_free(arm, cfg, home, R, tare, home, settle_s, clock, sleep).tool_pos.copy()
             series, peak, peak_f, broke = [], 0.0, np.zeros(3), False
+            joints = JointLog()
             t0 = clock()
             while True:
                 s = ramp_m_s * (clock() - t0)
                 target = p0 + d * s
                 st, f = _free_tick(arm, cfg, target, R, tare, home, sleep)
+                joints.add(clock() - t0, st)
                 moved = float((st.tool_pos - p0) @ d)
                 pull = k * (s - moved)
                 series.append([round(clock() - t0, 4), round(s, 6), round(moved, 6), round(pull, 4)]
@@ -1052,13 +1091,15 @@ def friction_breakaway(arm, cfg: BridgeConfig, directions=("+x", "-x", "+y", "-y
                 "est_along_N": float(peak_f @ d),  # tared estimate at the peak, along the pull direction
                 "est_N": peak_f.tolist(),
                 "series": series,  # t, target offset, moved, pull, fx, fy, fz
+                "joints": joints.rows,  # columns: joint_columns
             })
         _hold_free(arm, cfg, home, R, tare, home, 0.5, clock, sleep)
     finally:
         arm.stop_stream()
         arm.goto(home, R, 3.0)
     return {"ramp_mm_s": 1000 * ramp_m_s, "moved_mm": 1000 * moved_m, "max_pull_N": max_pull_N,
-            "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(), "rows": rows}
+            "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(), "joint_columns": JOINT_LOG_COLUMNS,
+            "rows": rows}
 
 
 def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0.01, 0.02), sweep_m=0.03,
@@ -1087,11 +1128,15 @@ def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0
         for v in speeds_m_s:
             pts = []  # position along the axis, direction, pull, fx, fy, fz
             series = []
+            joints = JointLog()  # t from the start of this speed's out stroke
+            t_speed = clock()
             for sgn, a, b in ((1.0, home, home + e * sweep_m), (-1.0, home + e * sweep_m, home)):
                 rec = []
+                t_stroke = clock() - t_speed
                 _move_free(arm, cfg, a, b, R, tare, home, v, clock, sleep, record=rec)
                 _hold_free(arm, cfg, b, R, tare, home, settle_s, clock, sleep)
                 for t, target, s, f in rec:
+                    joints.add(t_stroke + t, s)
                     prog = float((target - a) @ e) * sgn / sweep_m
                     pos = float((s.tool_pos - home) @ e)
                     pull = k * float((target - s.tool_pos) @ e)
@@ -1114,12 +1159,13 @@ def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0
                 "pose_error_N_per_cm": (coef[1, 1:] / 100.0).tolist(),
                 "n": len(P),
                 "series": series,  # direction, t, progress, position, pull, fx, fy, fz
+                "joints": joints.rows,  # columns: joint_columns
             })
     finally:
         arm.stop_stream()
         arm.goto(home, R, 3.0)
     out = {"axis": axis, "sweep_mm": 1000 * sweep_m, "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(),
-           "rows": rows}
+           "joint_columns": JOINT_LOG_COLUMNS, "rows": rows}
     sp = np.array([r["speed_mm_s"] / 1000 for r in rows])
     fr = np.array([r["friction_N"] for r in rows])
     if len(rows) >= 2 and np.ptp(sp) > 0:
@@ -1151,9 +1197,10 @@ def friction_steps(arm, cfg: BridgeConfig, steps_m=(0.0005, 0.001, 0.002, 0.004,
                 for step in steps_m:
                     p0 = arm.read().tool_pos.copy()  # friction may have left it short of home
                     target = p0 + d * step
-                    t0, t63, moved, series = clock(), None, 0.0, []
+                    t0, t63, moved, series, joints = clock(), None, 0.0, [], JointLog()
                     while clock() - t0 < hold_s:
                         s, f = _free_tick(arm, cfg, target, R, tare, home, sleep)
+                        joints.add(clock() - t0, s)
                         moved = float((s.tool_pos - p0) @ d)
                         series.append([round(clock() - t0, 4), round(moved, 6)])
                         if t63 is None and moved >= 0.63 * step:
@@ -1161,8 +1208,10 @@ def friction_steps(arm, cfg: BridgeConfig, steps_m=(0.0005, 0.001, 0.002, 0.004,
                     _hold_free(arm, cfg, home, R, tare, home, hold_s, clock, sleep)
                     rows.append({"axis": ax, "sign": int(sgn), "step_mm": 1000 * step, "moved_mm": 1000 * moved,
                                  "short_mm": 1000 * (step - moved), "t63_ms": None if t63 is None else 1000 * t63,
-                                 "series": series[::4]})  # t, moved
+                                 "series": series[::4],  # t, moved
+                                 "joints": joints.rows})  # columns: joint_columns
     finally:
         arm.stop_stream()
         arm.goto(home, R, 3.0)
-    return {"stiffness": list(cfg.stiffness), "hold_s": hold_s, "tare_N": tare.tolist(), "rows": rows}
+    return {"stiffness": list(cfg.stiffness), "hold_s": hold_s, "tare_N": tare.tolist(),
+            "joint_columns": JOINT_LOG_COLUMNS, "rows": rows}

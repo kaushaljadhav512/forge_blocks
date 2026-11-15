@@ -55,6 +55,18 @@ git log --oneline -1           # write down the commit
 > list `friction-breakaway`, `friction-sweep` and `friction-steps`. If they are missing, the pull didn't
 > get the new code: **don't go**, because without them this session only repeats session 1.
 
+> **Check the joint torques reach the logs (not yet verified on the robot).** The friction commands
+> also save `q`, `dq` and the joint torques for a later per-joint friction fit. The torques are read
+> from the state message as `tau_J` and `tau_ext_hat_filtered`, libfranka's names; nobody has confirmed
+> that FrankaPy's message uses them. With the controller running, in the container:
+>
+> ```bash
+> rostopic echo -n1 /robot_state_publisher_node_1/robot_state | grep -E "^(tau_J|tau_ext_hat_filtered):"
+> ```
+>
+> - [ ] Both fields are printed. If not, write down the torque field names that `rostopic echo -n1`
+>   does print. The tests still run, but their `joints` rows will have `None` for the torques.
+
 **Policy:** the same `exports/peg_forge_seed2` as v1 (see v1 §0 for the `scp`). It's only needed for
 session 3.
 
@@ -206,16 +218,19 @@ python3 deploy/run_peg.py force-drift --seconds 30 --sweep_m 0 --ack-safety
 python3 deploy/run_peg.py friction-breakaway --ack-safety
 python3 deploy/run_peg.py friction-sweep --axis x --speeds 5 --ack-safety
 python3 deploy/run_peg.py friction-sweep --axis y --speeds 5 --ack-safety
+python3 deploy/run_peg.py friction-sweep --axis z --speeds 5 --ack-safety
 ```
 
-(The z sweep is skipped here: there isn't 3 cm of free space below.)
+The z sweep moves **up** 3 cm and back down to the start (every sweep goes along +axis and returns), so
+it needs free space above the peg, not below. It is the most important one here: the policy descends
+onto the hole, and the vertical fake force is what read as contact in session 1.
 
 | | +x | −x | +y | −y | +z | −z |
 |---|---|---|---|---|---|---|
 | Breakaway, low pose (N) | | | | | | |
 | Breakaway, high pose (from 2.3) (N) | | | | | | |
 
-- [ ] The x and y fake force at 5 mm/s, low pose: ______ / ______ N.
+- [ ] The x / y / z fake force at 5 mm/s, low pose: ______ / ______ / ______ N.
 - [ ] `force-drift` hold, low pose: max |f| ______ N, drift ______ N/s (want < 1 N, < 0.03 N/s).
 
 ### 2.7 Stiffness × 1.3

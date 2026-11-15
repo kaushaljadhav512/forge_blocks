@@ -304,7 +304,7 @@ def main(argv=None):
         b = out["viscous_N_per_m_s"]
         print(f"fit: F = Fc + b*v, Fc = {out['coulomb_N']:.2f} N, b = " + ("n/a (one speed)" if b is None else f"{b:.0f} N/(m/s)"))
         print("fake force along: < 0 opposes the motion. sim budget: under ~1 N of offset costs a few points; 2 N costs 7-20")
-        out["table"] = [{k: r[k] for k in r if k != "series"} for r in out["rows"]]
+        out["table"] = [{k: r[k] for k in r if k not in ("series", "joints")} for r in out["rows"]]
         save_check(args.dir, f"friction_sweep_{args.axis}", out)
         return 0
 
@@ -326,7 +326,7 @@ def main(argv=None):
                     t63 = "    -" if r["t63_ms"] is None else f"{r['t63_ms']:5.0f}"
                     cells.append(f"{r['moved_mm']:6.2f} {t63}")
                 print(f"  {'+' if sgn > 0 else '-'}{ax}       " + "".join(cells))
-        out["table"] = [{k: r[k] for k in r if k != "series"} for r in out["rows"]]
+        out["table"] = [{k: r[k] for k in r if k not in ("series", "joints")} for r in out["rows"]]
         save_check(args.dir, "friction_steps" if args.stiffness_scale == 1.0 else f"friction_steps_k{args.stiffness_scale:g}", out)
         return 0
 
