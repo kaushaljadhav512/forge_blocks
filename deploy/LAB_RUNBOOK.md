@@ -16,8 +16,8 @@ There are two sessions:
 
 > **Safety, every time**
 > - Two people: one runs the commands, one holds the **E-stop** the whole time the arm can move.
-> - Every command that moves the arm needs `--ack-safety`. Most also ask you to type `YES`, **but
->   `rate-test` and `guide` start the moment you press Enter**: be ready before you do.
+> - Every command that moves the arm needs `--ack-safety` and asks `[y/N]` first: type `y` to go on
+>   (Enter alone or `n` cancels). **The arm moves as soon as you answer `y`**: be ready before you do.
 > - Keep hands out of the workspace while the arm moves, except where a step tells you to touch it
 >   (hanging weights, guide mode).
 > - If anything looks wrong (unexpected motion, grinding, the peg slipping), press the E-stop first and
@@ -358,9 +358,9 @@ Send the zip, the videos, the `summary` output and your notes.
 |---|---|---|
 | `check` | no | State, poses, raw force, Jacobian, calibration so far |
 | `home` | yes | FrankaPy's home pose |
-| `guide --seconds N` | by hand | Guide mode for N s (**starts without a YES prompt**) |
+| `guide --seconds N` | by hand | Guide mode for N s |
 | `open` / `grasp` | gripper | Open / close on the peg (8 mm, 40 N) |
-| `rate-test` | 2 mm | Stream rate, delay, policy time (**starts without a YES prompt**) |
+| `rate-test` | 2 mm | Stream rate, delay, policy time |
 | `press-test` | contact | Force sign → `calibration.json` |
 | `force-curve` | contact | Estimate vs commanded push, 0–15 N |
 | `force-scale` | contact | Commanded vs scale vs estimate |
@@ -383,7 +383,7 @@ Everything is saved in `deploy/runs/`:
 - A command crashes in `FrankaPyArm`: FrankaPy versions differ. Copy the full error into your notes and
   stop.
 - `no contact within the descent limit`: the surface is more than 6–8 cm below the peg. Start lower.
-- `operator cancelled`: you typed something other than `YES`. Run the command again.
+- `operator cancelled`: you answered `n` or just pressed Enter at a `[y/N]` question. Run the command again.
 - `unexpected peg grasp width 0.045 m`: an old bridge read the width while the fingers were still
   closing (FrankaPy's `goto_gripper` doesn't wait for grasps). Fixed on `lukas`; pull it.
 - `robot state is … ms old`: the state topic stopped. Check the three FrankaPy terminals.

@@ -31,7 +31,7 @@ There are two sessions:
 - **Session 3 (about 2 h): insertions**, with whatever fix session 2 leads to. This is v1's "Session 2".
 
 > **Safety, every time.** Same as v1: two people, one on the **E-stop** whenever the arm can move;
-> `--ack-safety` on every moving command; **`rate-test` and `guide` start the moment you press Enter**;
+> `--ack-safety` and a `[y/N]` question on every moving command; **the arm moves as soon as you answer `y`**;
 > hands out of the workspace; E-stop first, questions later. Do not change any limit or default in the
 > code. If a step fails, stop and report it.
 >

@@ -40,9 +40,19 @@ import franka_bridge as fb  # noqa: E402
 from policy_runner import ForgePolicyRunner  # noqa: E402
 
 
-def confirm(msg):
-    if input(msg + " Type YES to continue: ").strip() != "YES":
-        raise fb.HardwareError("operator cancelled")
+def confirm(msg, ask=input):
+    """Ask a yes/no question, no by default: y/yes continues; Enter, n/no or Ctrl-D cancels; anything
+    else asks again."""
+    while True:
+        try:
+            answer = ask(msg + " [y/N] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer in ("y", "yes"):
+            return
+        if answer in ("", "n", "no"):
+            raise fb.HardwareError("operator cancelled")
+        print("Please answer y or n.")
 
 
 def log_event(path, **fields):
@@ -205,12 +215,14 @@ def main(argv=None):
         return 0
 
     if args.cmd == "guide":
-        print(f"Guide mode for {args.seconds:.0f} s: move the arm by hand.")
+        confirm(f"Guide mode for {args.seconds:.0f} s: the arm goes limp under gravity compensation and you move it by "
+                "hand. Ready to hold it?")
         arm.guide(args.seconds, block=True)
         return 0
 
     if args.cmd == "rate-test":
         runner = make_runner(args, calib, need_sign=False) if args.export else None
+        confirm(f"Arm holds its pose for {args.seconds:g} s, then steps the target 2 mm up. Clear above the peg?")
         out = fb.rate_test(arm, cfg, args.seconds, runner)
         print(json.dumps(out, indent=2))
         log_event(args.dir / "events.jsonl", event="rate_test", control_hz=args.control_hz, **out)

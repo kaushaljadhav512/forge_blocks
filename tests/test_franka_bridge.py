@@ -752,6 +752,32 @@ class TestFrictionWalk(unittest.TestCase):
         self.assertIsNone(fb.walk_approach([0.31, 0.0, 0.70], spec))  # above the corridor
         self.assertEqual(len(fb.walk_approach(spec.centre, spec)), 1)
 
+    def test_confirm_is_yes_no_with_no_by_default(self):
+        import run_peg
+
+        def asker(*answers):
+            it = iter(answers)
+            asked = []
+
+            def ask(prompt):
+                asked.append(prompt)
+                a = next(it)
+                if a is EOFError:
+                    raise EOFError
+                return a
+            return ask, asked
+
+        for yes in ("y", "Y", "yes", " YES "):
+            ask, asked = asker(yes)
+            run_peg.confirm("Path clear?", ask)
+            self.assertEqual(asked, ["Path clear? [y/N] "])
+        for no in ("", "n", "No", EOFError):
+            with self.assertRaises(fb.HardwareError):
+                run_peg.confirm("Path clear?", asker(no)[0])
+        ask, asked = asker("maybe", "yse", "y")  # invalid answers ask again
+        run_peg.confirm("Path clear?", ask)
+        self.assertEqual(len(asked), 3)
+
     def test_save_check_keeps_time_series_out_of_calibration(self):
         import tempfile
         from pathlib import Path
