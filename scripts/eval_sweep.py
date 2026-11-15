@@ -141,6 +141,8 @@ def main():
     if not hasattr(env_cfg.obs_rand, "error_radius_mode"):
         sys.exit(f"{args_cli.task} has no radius option; use an Isaac-ForgeBlocks-* task ID")
     agent_cfg = load_cfg_from_registry(args_cli.task, "rl_games_cfg_entry_point")
+    # Policy on the sim's GPU. The agent config says cuda:0, so with --device cuda:1 the two would differ.
+    agent_cfg["params"]["config"]["device"] = agent_cfg["params"]["config"]["device_name"] = env_cfg.sim.device
 
     env_cfg.obs_rand.ft_force_scale = args_cli.force_scale
     env_cfg.obs_rand.ft_force_bias_N = args_cli.force_bias_N
