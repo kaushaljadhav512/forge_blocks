@@ -956,3 +956,213 @@ def force_drift(arm, cfg: BridgeConfig, hold_s=15.0, sweep_m=0.04, sweep_m_s=0.0
     out["worst_norm_N"] = float(max(np.linalg.norm(hf, axis=1).max(),
                                     np.linalg.norm(np.array([f for _, f in sweep]), axis=1).max() if sweep else 0.0))
     return out
+
+
+# --- Joint friction (session 2) -------------------------------------------------------------------
+#
+# Session 1 (TEST_SUMMARY.md, test 6): a 2 mm target step (1.1 N of spring pull) didn't move the arm,
+# ~2 N was needed to start moving, and moving made the force estimate read 1.5-2.4 N opposing the
+# motion. The policy commands targets a few mm from the fingertip (1-5 N of pull) near the hole, and
+# the sim has no friction. These three checks measure what a sim friction model (or a controller
+# compensation) needs. All of them run in free space: nothing may touch the peg.
+#
+# The spring pull along an axis is stiffness * (target - hand). At rest it is what friction holds
+# back; at a steady speed v it is Fc + b*v, where b also includes the controller's own damping.
+
+AXES = {"x": np.array([1.0, 0.0, 0.0]), "y": np.array([0.0, 1.0, 0.0]), "z": np.array([0.0, 0.0, 1.0])}
+FRICTION_MAX_FORCE_N = 10.0  # free space: a tared reading above this means something touches the peg
+FRICTION_MAX_TRAVEL_M = 0.05  # the hand never goes further than this from where the check started
+
+
+def _free_tick(arm, cfg: BridgeConfig, target_tool, R, tare, home, sleep, max_force_N=FRICTION_MAX_FORCE_N,
+               max_travel_m=FRICTION_MAX_TRAVEL_M):
+    """One control tick in free space: read, check, send the target, sleep. Returns (state, tared force)."""
+    st = arm.read()
+    f = st.force - tare
+    if np.linalg.norm(f) > max_force_N:
+        raise SafetyStop(f"force {np.linalg.norm(f):.1f} N in free space; is something touching the peg?")
+    if np.linalg.norm(st.tool_pos - home) > max_travel_m:
+        raise SafetyStop(f"hand moved more than {100 * max_travel_m:.0f} cm from the start")
+    arm.send_target(target_tool, R)
+    sleep(1.0 / cfg.control_hz)
+    return st, f
+
+
+def _hold_free(arm, cfg, target_tool, R, tare, home, seconds, clock, sleep):
+    t0 = clock()
+    st = None
+    while clock() - t0 < seconds:
+        st, _ = _free_tick(arm, cfg, target_tool, R, tare, home, sleep)
+    return st
+
+
+def _move_free(arm, cfg, a, b, R, tare, home, speed_m_s, clock, sleep, record=None):
+    """Move the target from a to b at constant speed. Appends (t, target, state, force) to record."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    T = max(np.linalg.norm(b - a) / speed_m_s, 1e-9)
+    t0 = clock()
+    while True:
+        s = min((clock() - t0) / T, 1.0)
+        target = a + s * (b - a)
+        st, f = _free_tick(arm, cfg, target, R, tare, home, sleep)
+        if record is not None:
+            record.append((clock() - t0, target.copy(), st, f))
+        if s >= 1.0:
+            return
+
+
+def friction_breakaway(arm, cfg: BridgeConfig, directions=("+x", "-x", "+y", "-y", "+z", "-z"), ramp_m_s=0.0005,
+                       moved_m=0.0005, max_pull_N=8.0, settle_s=1.0, clock=time.monotonic, sleep=time.sleep):
+    """Stiction. For each direction, move the target away from the hand slowly (0.5 mm/s: the spring
+    pull grows by 0.28 N/s at 565 N/m) until the hand has moved `moved_m`. The breakaway force is the
+    largest pull before that (just before it slips). Gives up at max_pull_N. Then the target returns."""
+    st = arm.read()
+    home, R = st.tool_pos.copy(), st.tool_R.copy()
+    per_dir = settle_s + 2 * (max_pull_N / min(cfg.stiffness[:3]) + moved_m) / ramp_m_s + 2.0
+    arm.start_stream(home, R, cfg.stiffness, max_duration=len(directions) * per_dir + 15)
+    rows = []
+    try:
+        tare = stream_tare(arm, home, R, cfg, clock, sleep)
+        for name in directions:
+            d = (-1.0 if name[0] == "-" else 1.0) * AXES[name[1]]
+            k = float(cfg.stiffness["xyz".index(name[1])])
+            p0 = _hold_free(arm, cfg, home, R, tare, home, settle_s, clock, sleep).tool_pos.copy()
+            series, peak, peak_f, broke = [], 0.0, np.zeros(3), False
+            t0 = clock()
+            while True:
+                s = ramp_m_s * (clock() - t0)
+                target = p0 + d * s
+                st, f = _free_tick(arm, cfg, target, R, tare, home, sleep)
+                moved = float((st.tool_pos - p0) @ d)
+                pull = k * (s - moved)
+                series.append([round(clock() - t0, 4), round(s, 6), round(moved, 6), round(pull, 4)]
+                              + [round(float(x), 4) for x in f])
+                if pull > peak:
+                    peak, peak_f = pull, f.copy()
+                if moved > moved_m:
+                    broke = True
+                    break
+                if pull > max_pull_N:
+                    break
+            _move_free(arm, cfg, target, home, R, tare, home, 0.005, clock, sleep)
+            rows.append({
+                "direction": name,
+                "breakaway_N": float(peak) if broke else None,
+                "max_pull_N": float(peak),
+                "est_along_N": float(peak_f @ d),  # tared estimate at the peak, along the pull direction
+                "est_N": peak_f.tolist(),
+                "series": series,  # t, target offset, moved, pull, fx, fy, fz
+            })
+        _hold_free(arm, cfg, home, R, tare, home, 0.5, clock, sleep)
+    finally:
+        arm.stop_stream()
+        arm.goto(home, R, 3.0)
+    return {"ramp_mm_s": 1000 * ramp_m_s, "moved_mm": 1000 * moved_m, "max_pull_N": max_pull_N,
+            "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(), "rows": rows}
+
+
+def friction_sweep(arm, cfg: BridgeConfig, axis="x", speeds_m_s=(0.002, 0.005, 0.01, 0.02), sweep_m=0.03,
+                   settle_s=0.5, steady=(0.35, 0.95), clock=time.monotonic, sleep=time.sleep):
+    """Kinetic friction and what it does to the force estimate. For each speed, the target moves
+    sweep_m along +axis and back at that speed. On the steady part of each stroke (the `steady`
+    fraction of the target's path), fit, for the pull and for each axis of the tared estimate:
+
+        value = a + g * position + h * direction        (direction = +1 / -1)
+
+    Friction flips with the direction of motion and a pose-dependent error doesn't, so h is the
+    friction (in the pull: the friction force; in the estimate: the fake force it adds) and g is the
+    pose-dependent error. Across speeds, friction = Fc + b * speed. b includes the controller's damping, so
+    read Fc, not b, as joint friction. The steady window skips the start of each stroke, where the hand
+    first sticks and then catches up."""
+    e = AXES[axis]
+    i = "xyz".index(axis)
+    k = float(cfg.stiffness[i])
+    st = arm.read()
+    home, R = st.tool_pos.copy(), st.tool_R.copy()
+    total = sum(2 * (sweep_m / v + settle_s) for v in speeds_m_s)
+    arm.start_stream(home, R, cfg.stiffness, max_duration=total + 20)
+    rows = []
+    try:
+        tare = stream_tare(arm, home, R, cfg, clock, sleep)
+        for v in speeds_m_s:
+            pts = []  # position along the axis, direction, pull, fx, fy, fz
+            series = []
+            for sgn, a, b in ((1.0, home, home + e * sweep_m), (-1.0, home + e * sweep_m, home)):
+                rec = []
+                _move_free(arm, cfg, a, b, R, tare, home, v, clock, sleep, record=rec)
+                _hold_free(arm, cfg, b, R, tare, home, settle_s, clock, sleep)
+                for t, target, s, f in rec:
+                    prog = float((target - a) @ e) * sgn / sweep_m
+                    pos = float((s.tool_pos - home) @ e)
+                    pull = k * float((target - s.tool_pos) @ e)
+                    series.append([round(sgn), round(t, 4), round(prog, 4), round(pos, 6), round(pull, 4)]
+                                  + [round(float(x), 4) for x in f])
+                    if steady[0] <= prog <= steady[1]:
+                        pts.append([pos, sgn, pull, *f])
+            P = np.array(pts)
+            if len(P) < 4 or len(set(P[:, 1])) < 2:
+                raise HardwareError("too few steady samples; lower the speed or raise --control_hz")
+            A = np.column_stack([np.ones(len(P)), P[:, 0], P[:, 1]])
+            coef = np.linalg.lstsq(A, P[:, 2:], rcond=None)[0]  # rows: a, g, h; columns: pull, fx, fy, fz
+            fake = coef[2, 1:]
+            rows.append({
+                "speed_mm_s": 1000 * v,
+                "friction_N": float(coef[2, 0]),  # pull needed to keep moving: Fc + b*v
+                "fake_along_N": float(fake[i]),  # estimate along the motion (signed: <0 opposes it)
+                "fake_across_N": float(np.max(np.abs(np.delete(fake, i)))),
+                "fake_N": fake.tolist(),  # per axis, for motion in +axis
+                "pose_error_N_per_cm": (coef[1, 1:] / 100.0).tolist(),
+                "n": len(P),
+                "series": series,  # direction, t, progress, position, pull, fx, fy, fz
+            })
+    finally:
+        arm.stop_stream()
+        arm.goto(home, R, 3.0)
+    out = {"axis": axis, "sweep_mm": 1000 * sweep_m, "stiffness": list(cfg.stiffness[:3]), "tare_N": tare.tolist(),
+           "rows": rows}
+    sp = np.array([r["speed_mm_s"] / 1000 for r in rows])
+    fr = np.array([r["friction_N"] for r in rows])
+    if len(rows) >= 2 and np.ptp(sp) > 0:
+        b, fc = np.polyfit(sp, fr, 1)
+        out["coulomb_N"], out["viscous_N_per_m_s"] = float(fc), float(b)
+    else:
+        out["coulomb_N"], out["viscous_N_per_m_s"] = float(fr[0]), None
+    out["worst_fake_along_N"] = float(max(abs(r["fake_along_N"]) for r in rows))
+    out["worst_fake_across_N"] = float(max(r["fake_across_N"] for r in rows))
+    out["pose_error_N_per_cm"] = np.mean([r["pose_error_N_per_cm"] for r in rows], axis=0).tolist()
+    return out
+
+
+def friction_steps(arm, cfg: BridgeConfig, steps_m=(0.0005, 0.001, 0.002, 0.004, 0.008), axes="xyz", hold_s=1.5,
+                   clock=time.monotonic, sleep=time.sleep):
+    """Policy-sized moves. For each axis, sign and step size, jump the target by the step, hold it
+    for hold_s, record how far the hand got and when it reached 63% of the step, then jump back
+    and hold again. With friction the hand stops where the pull drops below the kinetic friction,
+    short of the target; below the breakaway force it doesn't move at all."""
+    st = arm.read()
+    home, R = st.tool_pos.copy(), st.tool_R.copy()
+    arm.start_stream(home, R, cfg.stiffness, max_duration=len(axes) * 2 * len(steps_m) * 2 * hold_s + 20)
+    rows = []
+    try:
+        tare = stream_tare(arm, home, R, cfg, clock, sleep)
+        for ax in axes:
+            for sgn in (1.0, -1.0):
+                d = sgn * AXES[ax]
+                for step in steps_m:
+                    p0 = arm.read().tool_pos.copy()  # friction may have left it short of home
+                    target = p0 + d * step
+                    t0, t63, moved, series = clock(), None, 0.0, []
+                    while clock() - t0 < hold_s:
+                        s, f = _free_tick(arm, cfg, target, R, tare, home, sleep)
+                        moved = float((s.tool_pos - p0) @ d)
+                        series.append([round(clock() - t0, 4), round(moved, 6)])
+                        if t63 is None and moved >= 0.63 * step:
+                            t63 = clock() - t0
+                    _hold_free(arm, cfg, home, R, tare, home, hold_s, clock, sleep)
+                    rows.append({"axis": ax, "sign": int(sgn), "step_mm": 1000 * step, "moved_mm": 1000 * moved,
+                                 "short_mm": 1000 * (step - moved), "t63_ms": None if t63 is None else 1000 * t63,
+                                 "series": series[::4]})  # t, moved
+    finally:
+        arm.stop_stream()
+        arm.goto(home, R, 3.0)
+    return {"stiffness": list(cfg.stiffness), "hold_s": hold_s, "tare_N": tare.tolist(), "rows": rows}

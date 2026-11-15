@@ -11,6 +11,9 @@
     run_peg.py force-scale --ack-safety                press on a kitchen scale: commanded vs true vs estimate
     run_peg.py force-weights --ack-safety              hang known masses in free space: true vs estimate, sign
     run_peg.py force-drift --ack-safety                free space: drift over 15 s and error over a 4 cm move
+    run_peg.py friction-breakaway --ack-safety         free space: pull needed to start moving, 6 directions
+    run_peg.py friction-sweep --axis x --ack-safety    free space: friction and fake force vs speed, 3 cm and back
+    run_peg.py friction-steps --ack-safety             free space: how far policy-sized target steps get
     run_peg.py register-hole --ack-safety              hand-guide into the hole 5x -> hole.json
     run_peg.py shadow --export EXPORT                  guide mode; policy runs but commands nothing
     run_peg.py run --export EXPORT --air --trials 1 --ack-safety          estimate 10 cm high: no contact
@@ -127,6 +130,17 @@ def main(argv=None):
     a = add("force-drift", moves=True)
     a.add_argument("--seconds", type=float, default=15.0)
     a.add_argument("--sweep_m", type=float, default=0.04)
+    a = add("friction-breakaway", moves=True)
+    a.add_argument("--max_N", type=float, default=8.0, help="give up at this spring pull")
+    a = add("friction-sweep", moves=True)
+    a.add_argument("--axis", choices=["x", "y", "z"], required=True)
+    a.add_argument("--speeds", type=float, nargs="+", default=[2.0, 5.0, 10.0, 20.0], help="mm/s")
+    a.add_argument("--sweep_mm", type=float, default=30.0)
+    a = add("friction-steps", moves=True)
+    a.add_argument("--steps_mm", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0, 8.0])
+    a.add_argument("--axes", default="xyz")
+    a.add_argument("--stiffness_scale", type=float, default=1.0,
+                   help="all six gains x this (0.7-1.3, the range the sim stress evals covered)")
     a = add("register-hole", moves=True)
     a.add_argument("--n", type=int, default=5)
     a = add("shadow", export=True)
@@ -259,6 +273,61 @@ def main(argv=None):
         print(f"worst |f| anywhere: {out['worst_norm_N']:.2f} N")
         print("sim budget: under ~1 N of offset costs a few points; 2 N costs 10-20")
         save_check(args.dir, "force_drift", out)
+        return 0
+
+    if args.cmd == "friction-breakaway":
+        if not 0.0 < args.max_N <= 8.0:
+            raise SystemExit("--max_N must be in (0, 8]")
+        confirm("Peg grasped, in free space, at least 10 cm clear in EVERY direction, nothing touching it?")
+        out = fb.friction_breakaway(arm, cfg, max_pull_N=args.max_N)
+        print("direction   breakaway pull (N)   estimate along it at the peak (N)")
+        for r in out["rows"]:
+            b = f"{r['breakaway_N']:6.2f}" if r["breakaway_N"] is not None else f">{r['max_pull_N']:5.1f} (no motion)"
+            print(f"  {r['direction']}        {b:18s}   {r['est_along_N']:6.2f}")
+        out["breakaway_N"] = {r["direction"]: r["breakaway_N"] for r in out["rows"]}
+        out["est_along_N"] = {r["direction"]: r["est_along_N"] for r in out["rows"]}
+        save_check(args.dir, "friction_breakaway", out)
+        return 0
+
+    if args.cmd == "friction-sweep":
+        if not 0.0 < args.sweep_mm <= 30.0 or not all(0.5 <= v <= 20.0 for v in args.speeds):
+            raise SystemExit("--sweep_mm must be in (0, 30] and --speeds in [0.5, 20] mm/s")
+        confirm(f"Peg grasped, in free space, at least {args.sweep_mm / 10 + 5:.0f} cm clear along +{args.axis} "
+                f"and 10 cm everywhere else, nothing touching it?")
+        out = fb.friction_sweep(arm, cfg, axis=args.axis, speeds_m_s=[v / 1000 for v in args.speeds],
+                                sweep_m=args.sweep_mm / 1000)
+        i = "xyz".index(args.axis)
+        print("speed (mm/s)   friction (N)   fake force along (N)   fake across (N)   pose error (N/cm)")
+        for r in out["rows"]:
+            print(f"  {r['speed_mm_s']:6.1f}        {r['friction_N']:6.2f}          {r['fake_along_N']:6.2f}"
+                  f"              {r['fake_across_N']:6.2f}           {r['pose_error_N_per_cm'][i]:6.3f}")
+        b = out["viscous_N_per_m_s"]
+        print(f"fit: F = Fc + b*v, Fc = {out['coulomb_N']:.2f} N, b = " + ("n/a (one speed)" if b is None else f"{b:.0f} N/(m/s)"))
+        print("fake force along: < 0 opposes the motion. sim budget: under ~1 N of offset costs a few points; 2 N costs 7-20")
+        out["table"] = [{k: r[k] for k in r if k != "series"} for r in out["rows"]]
+        save_check(args.dir, f"friction_sweep_{args.axis}", out)
+        return 0
+
+    if args.cmd == "friction-steps":
+        if not 0.7 <= args.stiffness_scale <= 1.3:
+            raise SystemExit("--stiffness_scale must be in [0.7, 1.3] (what the sim stress evals covered)")
+        if not all(0.0 < s <= 8.0 for s in args.steps_mm) or not set(args.axes) <= set("xyz"):
+            raise SystemExit("--steps_mm must be in (0, 8] and --axes letters from xyz")
+        cfg.stiffness = tuple(args.stiffness_scale * k for k in cfg.stiffness)
+        confirm("Peg grasped, in free space, at least 10 cm clear in EVERY direction, nothing touching it?")
+        out = fb.friction_steps(arm, cfg, steps_m=[s / 1000 for s in args.steps_mm], axes=args.axes)
+        print(f"stiffness x {args.stiffness_scale:g}: distance moved (mm) after {out['hold_s']:g} s; 63% time (ms)")
+        print("           " + "".join(f"{s:>12g}" for s in args.steps_mm) + "   (step, mm)")
+        for ax in args.axes:
+            for sgn in (1, -1):
+                rs = [r for r in out["rows"] if r["axis"] == ax and r["sign"] == sgn]
+                cells = []
+                for r in rs:
+                    t63 = "    -" if r["t63_ms"] is None else f"{r['t63_ms']:5.0f}"
+                    cells.append(f"{r['moved_mm']:6.2f} {t63}")
+                print(f"  {'+' if sgn > 0 else '-'}{ax}       " + "".join(cells))
+        out["table"] = [{k: r[k] for k in r if k != "series"} for r in out["rows"]]
+        save_check(args.dir, "friction_steps" if args.stiffness_scale == 1.0 else f"friction_steps_k{args.stiffness_scale:g}", out)
         return 0
 
     if args.cmd == "register-hole":

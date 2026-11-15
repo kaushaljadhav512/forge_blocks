@@ -38,6 +38,10 @@ What they cover:
   - `force-weights` reads hung masses, fits the dead band, and flags a `force_sign` that disagrees;
   - `force-drift` recovers a 0.05 N/s drift and a 0.2 N/cm pose-dependent error, and stops on contact;
   - `rate-test` reports the fake arm's 50 ms lag;
+  - `friction-breakaway` recovers the fake arm's stiction and the force it leaks into the estimate;
+  - `friction-sweep` separates Coulomb and viscous friction, the fake force opposing motion, and a
+    pose-dependent error;
+  - `friction-steps` stops short of the target by the kinetic friction / stiffness, less with stiffness × 1.3;
   - start-pose and error samplers;
   - saving and loading the hole registration.
 

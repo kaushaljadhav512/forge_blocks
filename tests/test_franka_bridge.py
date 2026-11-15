@@ -24,7 +24,23 @@ RIM = np.array([0.59, 0.0, 0.028])
 
 class FakeArm:
     def __init__(self, raw_sign=1.0, bias=(0.0, 0.0, 0.0), tau=0.1, R=fb.DOWN, spike_at=None, sense_deadband=0.0,
-                 act_deadband=0.0, drift=(0.0, 0.0, 0.0), z_gain=(0.0, 0.0, 0.0), stream_shift=(0.0, 0.0, 0.0)):
+                 act_deadband=0.0, drift=(0.0, 0.0, 0.0), z_gain=(0.0, 0.0, 0.0), stream_shift=(0.0, 0.0, 0.0),
+                 fric_coulomb=0.0, fric_static=None, fric_leak=0.0, pos_gain=None):
+        # Joint friction (per Cartesian axis, off unless fric_coulomb or fric_static is set): the hand
+        # stays put until the spring pull exceeds fric_static, then moves at (pull - fric_coulomb) /
+        # damping, and sticks again when the pull drops to fric_coulomb. damping = 565 * tau, so with no
+        # friction it is the same first-order lag as below. fric_leak of the friction force on the hand
+        # shows up in the raw estimate (the lab robot: a force opposing the motion).
+        self.fric_coulomb = fric_coulomb
+        self.fric_static = fric_coulomb if fric_static is None else fric_static
+        self.fric_leak = fric_leak
+        self.friction = fric_coulomb > 0 or self.fric_static > 0
+        self.damping = 565.0 * tau
+        self.k = np.full(3, 565.0)  # set from start_stream's stiffness
+        self.stuck = np.ones(3, dtype=bool)
+        self.fric_force = np.zeros(3)
+        self.pos_gain = None if pos_gain is None else np.array(pos_gain, dtype=float)  # N/m of tip displacement
+        self.p0 = None
         self.t = 0.0
         self.tip = RIM + np.array([0.0, 0.0, fb.START_ABOVE_RIM])
         self.z0 = None  # z_gain reference: the first tip height read
@@ -54,9 +70,30 @@ class FakeArm:
 
     def _advance(self, dt):
         self.t += dt
-        if self.target is not None:
+        self.fric_force = np.zeros(3)
+        if self.target is not None and self.friction:
+            self._advance_friction(dt)
+        elif self.target is not None:
             self.tip = self.tip + (self.target - self.tip) * min(1.0, dt / self.tau)
         self.tip[2] = max(self.tip[2], self._floor_tip_z(self.tip))
+
+    def _advance_friction(self, dt):
+        gap = self.target - self.tip
+        F = self.k * gap
+        step = np.zeros(3)
+        for i in range(3):
+            if self.stuck[i] and abs(F[i]) > self.fric_static:
+                self.stuck[i] = False
+            if not self.stuck[i] and abs(F[i]) <= self.fric_coulomb:
+                self.stuck[i] = True
+            if self.stuck[i]:
+                self.fric_force[i] = -F[i]  # static friction balances the pull
+                continue
+            self.fric_force[i] = -np.sign(F[i]) * self.fric_coulomb
+            step[i] = np.sign(F[i]) * (abs(F[i]) - self.fric_coulomb) / self.damping * dt
+            if abs(step[i]) > abs(gap[i]):
+                step[i] = gap[i]
+        self.tip = self.tip + step
 
     def env_force(self):
         if self.target is None or self.tip[2] > self._floor_tip_z(self.tip) + 1e-9:
@@ -67,11 +104,16 @@ class FakeArm:
     def read(self):
         if self.z0 is None:
             self.z0 = self.tip[2]
+        if self.p0 is None:
+            self.p0 = self.tip.copy()
         f = self.env_force() + self.ext_load
         f = np.sign(f) * np.clip(np.abs(f) - self.sense_deadband, 0.0, None)  # unreliable small forces
         f = self.raw_sign * f + self.bias + self.drift * self.t + self.z_gain * (self.tip[2] - self.z0)
         if self.streaming:
             f = f + self.stream_shift
+        f = f + self.fric_leak * self.fric_force
+        if self.pos_gain is not None:
+            f = f + self.pos_gain @ (self.tip - self.p0)
         if self.spike_at is not None and self.t > self.spike_at:
             f = f + np.array([0.0, 0.0, 100.0])
         return fb.RobotState(t=self.t, q=np.zeros(7), dq=np.zeros(7), tool_pos=fb.tip_to_tool(self.tip, self.R),
@@ -81,6 +123,7 @@ class FakeArm:
         assert not self.streaming
         self.streaming, self.streams = True, self.streams + 1
         self.target = fb.tool_to_tip(pos, R)
+        self.k = np.array(stiffness[:3], dtype=float)
 
     def send_target(self, pos, R):
         assert self.streaming, "target sent without a running stream"
@@ -94,6 +137,7 @@ class FakeArm:
     def goto(self, pos, R, duration, stiffness=None):
         self.tip, self.R = fb.tool_to_tip(pos, R), np.array(R, dtype=float)
         self.target = None
+        self.stuck[:] = True
         self._advance(duration)
 
     def stop(self):
@@ -309,6 +353,73 @@ class TestCalibration(unittest.TestCase):
             fb.force_drift(arm, fb.BridgeConfig(tare_s=0.05), hold_s=0.2, sweep_m=0.04, sweep_m_s=0.04,
                            clock=arm.clock, sleep=arm.sleep)
         self.assertFalse(arm.streaming)
+
+    def test_force_drift_hold_only(self):
+        arm = FakeArm(drift=(0.0, 0.05, 0.0))
+        out = fb.force_drift(arm, fb.BridgeConfig(tare_s=0.05), hold_s=2.0, sweep_m=0.0, clock=arm.clock, sleep=arm.sleep)
+        self.assertNotIn("sweep_max_abs_N", out)
+        self.assertAlmostEqual(out["hold_slope_N_per_s"][1], 0.05, delta=0.005)
+        self.assertFalse(arm.streaming)
+
+    def test_friction_breakaway_finds_stiction(self):
+        cfg = fb.BridgeConfig(tare_s=0.05)
+        arm = FakeArm(fric_static=3.0, fric_coulomb=2.0, fric_leak=0.5)
+        out = fb.friction_breakaway(arm, cfg, directions=("+x", "-z"), ramp_m_s=0.002, clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+        for r in out["rows"]:
+            self.assertAlmostEqual(r["breakaway_N"], 3.0, delta=0.1)
+            self.assertAlmostEqual(r["est_along_N"], -1.5, delta=0.1)  # stuck: static friction holds the pull
+        arm = FakeArm()
+        out = fb.friction_breakaway(arm, cfg, directions=("+y",), ramp_m_s=0.002, clock=arm.clock, sleep=arm.sleep)
+        self.assertLess(out["rows"][0]["breakaway_N"], 0.3)  # no friction: only the lag
+        arm = FakeArm(fric_static=9.0, fric_coulomb=2.0)
+        out = fb.friction_breakaway(arm, cfg, directions=("+x",), ramp_m_s=0.004, clock=arm.clock, sleep=arm.sleep)
+        self.assertIsNone(out["rows"][0]["breakaway_N"])  # gives up at max_pull_N
+        self.assertAlmostEqual(out["rows"][0]["max_pull_N"], 8.0, delta=0.1)
+
+    def test_friction_sweep_separates_friction_and_pose_error(self):
+        gain = np.zeros((3, 3))
+        gain[0, 0] = 20.0  # 0.2 N per cm of x
+        arm = FakeArm(fric_coulomb=2.0, fric_leak=0.8, pos_gain=gain)
+        out = fb.friction_sweep(arm, fb.BridgeConfig(tare_s=0.05), axis="x", speeds_m_s=(0.005, 0.02),
+                                clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+        self.assertAlmostEqual(out["coulomb_N"], 2.0, delta=0.1)
+        self.assertAlmostEqual(out["viscous_N_per_m_s"], 565.0 * 0.1, delta=3.0)  # the fake's damping
+        for r in out["rows"]:
+            self.assertAlmostEqual(r["fake_along_N"], -1.6, delta=0.05)  # opposes the motion
+            self.assertLess(r["fake_across_N"], 0.05)
+        self.assertAlmostEqual(out["pose_error_N_per_cm"][0], 0.2, delta=0.02)
+
+    def test_friction_sweep_stops_on_force(self):
+        arm = FakeArm(spike_at=1.5)
+        with self.assertRaises(fb.SafetyStop):
+            fb.friction_sweep(arm, fb.BridgeConfig(tare_s=0.05), axis="y", speeds_m_s=(0.01,),
+                              clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+
+    def test_friction_steps_stop_short(self):
+        steps = (0.002, 0.004)
+        arm = FakeArm(fric_static=2.0, fric_coulomb=1.5)
+        out = fb.friction_steps(arm, fb.BridgeConfig(tare_s=0.05), steps_m=steps, axes="x", hold_s=1.0,
+                                clock=arm.clock, sleep=arm.sleep)
+        self.assertFalse(arm.streaming)
+        by = {(r["sign"], r["step_mm"]): r for r in out["rows"]}
+        for sgn in (1, -1):
+            self.assertAlmostEqual(by[(sgn, 2.0)]["moved_mm"], 0.0, delta=0.01)  # 1.1 N < 2 N breakaway
+            self.assertIsNone(by[(sgn, 2.0)]["t63_ms"])
+            self.assertAlmostEqual(by[(sgn, 4.0)]["moved_mm"], 4.0 - 1000 * 1.5 / 565, delta=0.05)
+        stiff = fb.BridgeConfig(tare_s=0.05, stiffness=tuple(1.3 * k for k in fb.BridgeConfig().stiffness))
+        arm = FakeArm(fric_static=2.0, fric_coulomb=1.5)
+        out = fb.friction_steps(arm, stiff, steps_m=steps, axes="x", hold_s=1.0, clock=arm.clock, sleep=arm.sleep)
+        r = next(r for r in out["rows"] if r["sign"] == 1 and r["step_mm"] == 4.0)
+        self.assertAlmostEqual(r["moved_mm"], 4.0 - 1000 * 1.5 / (1.3 * 565), delta=0.05)
+        arm = FakeArm()
+        out = fb.friction_steps(arm, fb.BridgeConfig(tare_s=0.05), steps_m=(0.002,), axes="z", hold_s=1.0,
+                                clock=arm.clock, sleep=arm.sleep)
+        for r in out["rows"]:
+            self.assertAlmostEqual(r["moved_mm"], 2.0, delta=0.01)
+            self.assertAlmostEqual(r["t63_ms"], 100, delta=15)  # tau = 100 ms
 
     def test_rate_test_reports_step_latency(self):
         arm = FakeArm(tau=0.05)
