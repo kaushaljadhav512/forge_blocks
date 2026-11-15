@@ -293,6 +293,51 @@ class TestCalibration(unittest.TestCase):
         self.assertAlmostEqual(out["step_63pct_ms"], 50, delta=15)  # first-order lag with tau = 50 ms
         self.assertFalse(arm.streaming)
 
+    def test_frankapy_read_uses_one_state_request(self):
+        class Pose:
+            translation = [0.3, 0.0, 0.48]
+            rotation = fb.DOWN
+
+        class StubFA:  # FrankaArm's getters, counting the ones that go to the Control PC
+            requests = 0
+
+            def _req(self, value):
+                self.requests += 1
+                return value
+
+            def get_pose(self): return self._req(Pose())
+            def get_joints(self): return self._req(np.arange(7) * 0.1)
+            def get_joint_velocities(self): return self._req(np.ones(7) * 0.01)
+            def get_ee_force_torque(self): return self._req(np.array([1.0, -0.3, 3.7, 0.0, 0.0, 0.0]))
+            def get_jacobian(self, q): return np.eye(6, 7)  # computed locally in FrankaPy
+
+        class StubFACombined(StubFA):
+            def get_robot_state(self):
+                self.requests += 1
+                return {"pose": Pose(), "joints": np.arange(7) * 0.1, "joint_velocities": np.ones(7) * 0.01,
+                        "ee_force_torque": np.array([1.0, -0.3, 3.7, 0.0, 0.0, 0.0]), "gripper_width": 0.0064}
+
+        def make(fa):
+            arm = fb.FrankaPyArm.__new__(fb.FrankaPyArm)  # skip __init__: it imports rospy and frankapy
+            arm.fa = fa
+            arm.has_jacobian = hasattr(fa, "get_jacobian")
+            arm.has_robot_state = hasattr(fa, "get_robot_state")
+            return arm
+
+        combined, separate = StubFACombined(), StubFA()
+        states = {}
+        for name, fa, want_requests in [("combined", combined, 1), ("separate", separate, 4)]:
+            st = make(fa).read()
+            self.assertEqual(fa.requests, want_requests, name)
+            states[name] = st
+        for a, b in zip([states["combined"].q, states["combined"].dq, states["combined"].tool_pos,
+                         states["combined"].tool_R, states["combined"].force],
+                        [states["separate"].q, states["separate"].dq, states["separate"].tool_pos,
+                         states["separate"].tool_R, states["separate"].force]):
+            np.testing.assert_allclose(a, b)
+        np.testing.assert_allclose(states["combined"].force, [1.0, -0.3, 3.7])
+        self.assertEqual(states["combined"].J.shape, (6, 7))
+
     def test_samplers(self):
         rng = np.random.default_rng(1)
         for _ in range(200):

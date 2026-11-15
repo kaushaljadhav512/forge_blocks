@@ -176,6 +176,9 @@ class FrankaPyArm:
         self._id = 0
         self._t0 = 0.0
         self.has_jacobian = hasattr(self.fa, "get_jacobian")
+        # One request for the whole state (~1.5 ms on the lab robot) instead of four (~6.5 ms), and all
+        # fields come from the same instant. Older FrankaPy versions may lack it.
+        self.has_robot_state = hasattr(self.fa, "get_robot_state")
 
     def _pose(self, pos, R):
         return self._m["RigidTransform"](
@@ -184,16 +187,20 @@ class FrankaPyArm:
 
     def read(self) -> RobotState:
         fa = self.fa
-        pose = fa.get_pose()
-        q = np.asarray(fa.get_joints(), dtype=float)
-        J = np.asarray(fa.get_jacobian(q), dtype=float) if self.has_jacobian else None
+        if self.has_robot_state:
+            s = fa.get_robot_state()
+            pose, q, dq, ft = s["pose"], s["joints"], s["joint_velocities"], s["ee_force_torque"]
+        else:
+            pose, q, dq, ft = fa.get_pose(), fa.get_joints(), fa.get_joint_velocities(), fa.get_ee_force_torque()
+        q = np.asarray(q, dtype=float)
+        J = np.asarray(fa.get_jacobian(q), dtype=float) if self.has_jacobian else None  # local, no request
         return RobotState(
             t=time.monotonic(),
             q=q,
-            dq=np.asarray(fa.get_joint_velocities(), dtype=float),
+            dq=np.asarray(dq, dtype=float),
             tool_pos=np.asarray(pose.translation, dtype=float),
             tool_R=np.asarray(pose.rotation, dtype=float),
-            force=np.asarray(fa.get_ee_force_torque(), dtype=float)[:3],
+            force=np.asarray(ft, dtype=float)[:3],
             J=J if J is not None and J.shape == (6, 7) else None,
         ).check()
 
@@ -527,6 +534,7 @@ def rate_test(arm, cfg: BridgeConfig, seconds=5.0, runner: ForgePolicyRunner | N
     arm.start_stream(hold_pos, R, cfg.stiffness, max_duration=seconds + 10)
     sends, changes, last_q, last_f = 0, 0, None, None
     t0 = clock()
+    next_tick = t0
     out = {}
     try:
         while clock() - t0 < seconds:
@@ -536,7 +544,14 @@ def rate_test(arm, cfg: BridgeConfig, seconds=5.0, runner: ForgePolicyRunner | N
             last_q, last_f = s.q, s.force
             arm.send_target(hold_pos, R)
             sends += 1
-            sleep(max(0.0, 1.0 / cfg.control_hz - 1e-4))
+            # Sleep only what is left of the tick, like run_attempt, so the reported rate is the one the
+            # policy loop can reach (a full-period sleep on top of the read under-reported it).
+            next_tick += 1.0 / cfg.control_hz
+            delay = next_tick - clock()
+            if delay > 0:
+                sleep(delay)
+            else:
+                next_tick = clock()
         out = {"send_hz": sends / seconds, "state_update_hz": changes / seconds}
 
         z0 = arm.read().tool_pos[2]
