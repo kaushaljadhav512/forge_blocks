@@ -294,10 +294,15 @@ class TestCalibration(unittest.TestCase):
         self.assertFalse(arm.streaming)
 
     def test_frankapy_read_sources_agree(self):
-        # Raw end-effector pose O_T_EE (yawed, so a transpose mistake shows) and a non-identity tool delta.
-        yaw = math.radians(30.0)
+        # Raw end-effector pose O_T_EE and a non-identity tool delta. Tilted as well as yawed: any
+        # gripper-straight-down rotation is a 180 deg turn about a horizontal axis, hence symmetric, so
+        # with yaw alone a transposed rotation would go unnoticed.
+        yaw, tilt = math.radians(30.0), math.radians(10.0)
+        Rz = np.array([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
+        Rx = np.array([[1, 0, 0], [0, math.cos(tilt), -math.sin(tilt)], [0, math.sin(tilt), math.cos(tilt)]])
         B = np.eye(4)
-        B[:3, :3] = fb.DOWN @ np.array([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
+        B[:3, :3] = fb.DOWN @ Rz @ Rx
+        self.assertGreater(np.abs(B[:3, :3] - B[:3, :3].T).max(), 0.1)  # the test pose can catch a transpose
         B[:3, 3] = [0.3, -0.05, 0.48]
         D = np.eye(4)
         D[2, 3] = 0.01

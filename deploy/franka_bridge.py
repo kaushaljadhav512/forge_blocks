@@ -254,11 +254,14 @@ class FrankaPyArm:
         st = self.read()
         pose, q = self.fa.get_pose(), np.asarray(self.fa.get_joints(), dtype=float)
         dR = st.tool_R @ np.asarray(pose.rotation, dtype=float).T
+        # Small-angle form from the skew part: acos((trace - 1) / 2) is ill-conditioned near zero and turns
+        # O_T_EE's ~2e-5 non-orthonormality into a fake ~0.36 deg even for identical matrices.
+        skew = np.array([dR[2, 1] - dR[1, 2], dR[0, 2] - dR[2, 0], dR[1, 0] - dR[0, 1]]) / 2.0
         return {
             "source": self.state_source,
             "state_age_ms": 1000 * (time.monotonic() - st.t),
             "pos_diff_mm": 1000 * float(np.linalg.norm(st.tool_pos - np.asarray(pose.translation, dtype=float))),
-            "rot_diff_deg": math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(dR) - 1.0) / 2.0)))),
+            "rot_diff_deg": math.degrees(math.asin(min(1.0, float(np.linalg.norm(skew))))),
             "joint_diff_max_rad": float(np.max(np.abs(st.q - q))),
         }
 
