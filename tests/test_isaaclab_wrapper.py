@@ -22,7 +22,7 @@ class TestAgentDeviceOverrides(unittest.TestCase):
         self.overrides = _isaaclab.agent_device_overrides
 
     def test_device_moves_the_policy_too(self):
-        want = ["agent.params.config.device=cuda:1", "agent.params.config.device_name=cuda:1"]
+        want = ["++agent.params.config.device=cuda:1", "++agent.params.config.device_name=cuda:1"]
         self.assertEqual(self.overrides(["--task", "T", "--device", "cuda:1", "--headless"]), want)
         self.assertEqual(self.overrides(["--device=cuda:1"]), want)
 
@@ -31,7 +31,9 @@ class TestAgentDeviceOverrides(unittest.TestCase):
 
     def test_explicit_overrides_win(self):
         argv = ["--device", "cuda:1", "agent.params.config.device=cuda:0"]
-        self.assertEqual(self.overrides(argv), ["agent.params.config.device_name=cuda:1"])
+        self.assertEqual(self.overrides(argv), ["++agent.params.config.device_name=cuda:1"])
+        argv = ["--device", "cuda:1", "+agent.params.config.device_name=cuda:0"]
+        self.assertEqual(self.overrides(argv), ["++agent.params.config.device=cuda:1"])
 
 
 if __name__ == "__main__":

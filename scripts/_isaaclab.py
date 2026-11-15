@@ -27,7 +27,8 @@ def agent_device_overrides(argv: list[str]) -> list[str]:
     Upstream train.py and play.py (v2.3.2) move only the sim to --device; the policy stays on the agent
     config's device (cuda:0) unless training is distributed. With --device cuda:1 the two differ and the
     first step fails with "Expected all tensors to be on the same device". Overrides already given on the
-    command line win.
+    command line win. "++" sets a key and adds it if missing: FORGE's agent config has `device` but not
+    `device_name`, and a plain override of a missing key is a Hydra error.
     """
     device = None
     for i, arg in enumerate(argv):
@@ -40,8 +41,8 @@ def agent_device_overrides(argv: list[str]) -> list[str]:
     out = []
     for key in ("device", "device_name"):
         prefix = f"agent.params.config.{key}="
-        if not any(a.startswith(prefix) for a in argv):
-            out.append(prefix + device)
+        if not any(a.lstrip("+").startswith(prefix) for a in argv):
+            out.append("++" + prefix + device)
     return out
 
 
