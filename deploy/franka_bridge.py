@@ -41,6 +41,11 @@ SUCCESS_Z = 0.04 * HOLE_DEPTH  # ... and within success_threshold * height (1 mm
 DOWN = np.diag([1.0, -1.0, -1.0])  # gripper pointing down, yaw 0 (Lab2's TOP_R; sim roll = pi)
 SIM_FORCE_UP_WHEN_PRESSING = 1.0  # measure_frames.py: pressing down on a surface reads +z in sim
 
+# --- Robot state (FrankaPy robot_num 1) -----------------------------------------------------------
+
+ROBOT_STATE_TOPIC = "/robot_state_publisher_node_1/robot_state"  # franka_interface_msgs/RobotState, 100 Hz in the lab
+MAX_STATE_AGE_S = 0.1  # 10 missed messages: treat the state as lost and stop
+
 
 # --- Rotations (quaternions are w, x, y, z like the runner) ---------------------------------------
 
@@ -176,9 +181,36 @@ class FrankaPyArm:
         self._id = 0
         self._t0 = 0.0
         self.has_jacobian = hasattr(self.fa, "get_jacobian")
-        # One request for the whole state (~1.5 ms on the lab robot) instead of four (~6.5 ms), and all
-        # fields come from the same instant. Older FrankaPy versions may lack it.
+        # FrankaPy's get_pose() is O_T_EE * tool_delta_pose (identity unless someone sets it); the raw
+        # state (topic or get_robot_state) is O_T_EE only, so apply the same delta to match get_pose().
+        delta = getattr(self.fa, "_tool_delta_pose", None)
+        self._tool_delta = np.asarray(delta.matrix, dtype=float) if delta is not None else np.eye(4)
+        # Fallback: one service request for the whole state (~1.5 ms) instead of four (~6.5 ms). On the
+        # lab robot its answer only refreshes at ~30 Hz, while the topic below publishes at 100 Hz.
         self.has_robot_state = hasattr(self.fa, "get_robot_state")
+        self.state_source = "get_robot_state" if self.has_robot_state else "separate calls"
+        self._latest = None  # (RobotState msg, monotonic receive time), written by the ROS callback thread
+        self._subscribe(rospy)
+
+    def _subscribe(self, rospy, wait_s=1.0):
+        """Listen to FrankaPy's robot-state topic; read() then costs no request at all."""
+        try:
+            from franka_interface_msgs.msg import RobotState as RobotStateMsg
+        except ImportError:
+            return
+        sub = rospy.Subscriber(ROBOT_STATE_TOPIC, RobotStateMsg, self._on_state, queue_size=1, tcp_nodelay=True)
+        end = time.monotonic() + wait_s
+        while self._latest is None and time.monotonic() < end:
+            time.sleep(0.01)
+        if self._latest is None:
+            sub.unregister()
+            print(f"WARNING: no message on {ROBOT_STATE_TOPIC} within {wait_s:.0f} s; reading state with "
+                  f"{self.state_source} (slower, ~30 Hz fresh data)")
+        else:
+            self.state_source = "topic"
+
+    def _on_state(self, msg):
+        self._latest = (msg, time.monotonic())  # one tuple assignment: read() never sees a half update
 
     def _pose(self, pos, R):
         return self._m["RigidTransform"](
@@ -186,23 +218,49 @@ class FrankaPyArm:
         )
 
     def read(self) -> RobotState:
+        """Latest robot state. `t` is when that state arrived (topic) or was fetched (fallbacks), so
+        two reads of the same message have the same `t`."""
         fa = self.fa
-        if self.has_robot_state:
+        if self.state_source == "topic":
+            msg, t = self._latest
+            age = time.monotonic() - t
+            if age > MAX_STATE_AGE_S:
+                raise SafetyStop(f"robot state is {1000 * age:.0f} ms old; {ROBOT_STATE_TOPIC} stopped publishing?")
+            T = np.asarray(msg.O_T_EE, dtype=float).reshape(4, 4).T @ self._tool_delta  # as FrankaPy's utils
+            q, dq, ft = msg.q, msg.dq, msg.O_F_ext_hat_K
+        elif self.has_robot_state:
+            t = time.monotonic()
             s = fa.get_robot_state()
-            pose, q, dq, ft = s["pose"], s["joints"], s["joint_velocities"], s["ee_force_torque"]
+            T = np.asarray(s["pose"].matrix, dtype=float) @ self._tool_delta
+            q, dq, ft = s["joints"], s["joint_velocities"], s["ee_force_torque"]
         else:
-            pose, q, dq, ft = fa.get_pose(), fa.get_joints(), fa.get_joint_velocities(), fa.get_ee_force_torque()
+            t = time.monotonic()
+            T = np.asarray(fa.get_pose().matrix, dtype=float)  # get_pose() already includes the tool delta
+            q, dq, ft = fa.get_joints(), fa.get_joint_velocities(), fa.get_ee_force_torque()
         q = np.asarray(q, dtype=float)
         J = np.asarray(fa.get_jacobian(q), dtype=float) if self.has_jacobian else None  # local, no request
         return RobotState(
-            t=time.monotonic(),
+            t=t,
             q=q,
             dq=np.asarray(dq, dtype=float),
-            tool_pos=np.asarray(pose.translation, dtype=float),
-            tool_R=np.asarray(pose.rotation, dtype=float),
+            tool_pos=T[:3, 3].copy(),
+            tool_R=T[:3, :3].copy(),
             force=np.asarray(ft, dtype=float)[:3],
             J=J if J is not None and J.shape == (6, 7) else None,
         ).check()
+
+    def compare_with_service(self) -> dict:
+        """Topic state vs FrankaPy's own get_pose()/get_joints(): they should agree to well under a mm."""
+        st = self.read()
+        pose, q = self.fa.get_pose(), np.asarray(self.fa.get_joints(), dtype=float)
+        dR = st.tool_R @ np.asarray(pose.rotation, dtype=float).T
+        return {
+            "source": self.state_source,
+            "state_age_ms": 1000 * (time.monotonic() - st.t),
+            "pos_diff_mm": 1000 * float(np.linalg.norm(st.tool_pos - np.asarray(pose.translation, dtype=float))),
+            "rot_diff_deg": math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(dR) - 1.0) / 2.0)))),
+            "joint_diff_max_rad": float(np.max(np.abs(st.q - q))),
+        }
 
     def goto(self, pos, R, duration, stiffness=None):
         """Blocking Cartesian move (FrankaPy's impedance controller)."""
@@ -411,12 +469,14 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
     arm.start_stream(st.tool_pos, st.tool_R, cfg.stiffness, max_duration=cfg.timeout_s + 5.0)
     t0 = clock()
     next_policy, next_tick = t0, t0
-    prev, force_sum, ticks = None, 0.0, 0
+    prev, prev_now, force_sum, ticks = None, None, 0.0, 0
     try:
         while True:
             st = arm.read()
             now = clock()
-            dt = (st.t - prev.t) if prev is not None and st.t > prev.t else 1.0 / cfg.control_hz
+            # Filter over the time since the last tick, holding the latest sample (state arrives at 100 Hz,
+            # ticks run at up to 200 Hz, so a sample can be read twice; using st.t would over-weight it).
+            dt = now - prev_now if prev_now is not None else 1.0 / cfg.control_hz
             fs = ff.update(st.force - tare, dt)  # runner.build_obs applies force_sign
             tip, quat, R = tip_pose(st, cfg)
             v, w = tip_velocity(st, prev, cfg)
@@ -448,7 +508,7 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
 
             target_R = quat_to_mat(target_quat)
             arm.send_target(tip_to_tool(target_pos, target_R, cfg.tip_offset), target_R)
-            prev = st
+            prev, prev_now = st, now
             next_tick += 1.0 / cfg.control_hz
             delay = next_tick - clock()
             if delay > 0:

@@ -162,6 +162,9 @@ def main(argv=None):
         print("Jacobian from FrankaPy:", "yes" if st.J is not None else "no (velocities from pose differences)")
         print("gripper width (m):", round(float(arm.fa.get_gripper_width()), 4))
         print("calibration:", calib or "none yet")
+        cmp = arm.compare_with_service()  # arm still: should match to << 1 mm, << 0.1 deg
+        print(f"state source: {cmp['source']}, age {cmp['state_age_ms']:.0f} ms; vs FrankaPy get_pose/get_joints: "
+              f"pos {cmp['pos_diff_mm']:.3f} mm, rot {cmp['rot_diff_deg']:.3f} deg, joints {cmp['joint_diff_max_rad']:.5f} rad")
         return 0
 
     if args.cmd == "home":

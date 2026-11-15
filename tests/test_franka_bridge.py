@@ -293,50 +293,76 @@ class TestCalibration(unittest.TestCase):
         self.assertAlmostEqual(out["step_63pct_ms"], 50, delta=15)  # first-order lag with tau = 50 ms
         self.assertFalse(arm.streaming)
 
-    def test_frankapy_read_uses_one_state_request(self):
-        class Pose:
-            translation = [0.3, 0.0, 0.48]
-            rotation = fb.DOWN
+    def test_frankapy_read_sources_agree(self):
+        # Raw end-effector pose O_T_EE (yawed, so a transpose mistake shows) and a non-identity tool delta.
+        yaw = math.radians(30.0)
+        B = np.eye(4)
+        B[:3, :3] = fb.DOWN @ np.array([[math.cos(yaw), -math.sin(yaw), 0], [math.sin(yaw), math.cos(yaw), 0], [0, 0, 1]])
+        B[:3, 3] = [0.3, -0.05, 0.48]
+        D = np.eye(4)
+        D[2, 3] = 0.01
+        q, dq, ft = np.arange(7) * 0.1, np.ones(7) * 0.01, np.array([1.0, -0.3, 3.7, 0.0, 0.0, 0.0])
+
+        class Pose:  # the parts of autolab_core.RigidTransform the bridge uses
+            def __init__(self, T):
+                self.matrix, self.translation, self.rotation = T, T[:3, 3], T[:3, :3]
 
         class StubFA:  # FrankaArm's getters, counting the ones that go to the Control PC
-            requests = 0
+            def __init__(self):
+                self.requests = 0
+                self._tool_delta_pose = Pose(D)
 
             def _req(self, value):
                 self.requests += 1
                 return value
 
-            def get_pose(self): return self._req(Pose())
-            def get_joints(self): return self._req(np.arange(7) * 0.1)
-            def get_joint_velocities(self): return self._req(np.ones(7) * 0.01)
-            def get_ee_force_torque(self): return self._req(np.array([1.0, -0.3, 3.7, 0.0, 0.0, 0.0]))
+            def get_pose(self): return self._req(Pose(B @ D))  # FrankaPy applies the tool delta here
+            def get_joints(self): return self._req(q)
+            def get_joint_velocities(self): return self._req(dq)
+            def get_ee_force_torque(self): return self._req(ft)
             def get_jacobian(self, q): return np.eye(6, 7)  # computed locally in FrankaPy
 
         class StubFACombined(StubFA):
-            def get_robot_state(self):
-                self.requests += 1
-                return {"pose": Pose(), "joints": np.arange(7) * 0.1, "joint_velocities": np.ones(7) * 0.01,
-                        "ee_force_torque": np.array([1.0, -0.3, 3.7, 0.0, 0.0, 0.0]), "gripper_width": 0.0064}
+            def get_robot_state(self):  # raw O_T_EE, no tool delta
+                return self._req({"pose": Pose(B), "joints": q, "joint_velocities": dq, "ee_force_torque": ft})
 
-        def make(fa):
+        class Msg:  # franka_interface_msgs/RobotState: O_T_EE is column-major
+            pass
+
+        msg_in = Msg()
+        msg_in.O_T_EE, msg_in.q, msg_in.dq, msg_in.O_F_ext_hat_K = tuple(B.T.reshape(-1)), tuple(q), tuple(dq), tuple(ft)
+
+        def make(fa, source):
             arm = fb.FrankaPyArm.__new__(fb.FrankaPyArm)  # skip __init__: it imports rospy and frankapy
             arm.fa = fa
-            arm.has_jacobian = hasattr(fa, "get_jacobian")
+            arm.has_jacobian = True
             arm.has_robot_state = hasattr(fa, "get_robot_state")
+            arm._tool_delta = fa._tool_delta_pose.matrix
+            arm.state_source, arm._latest = source, None
             return arm
 
-        combined, separate = StubFACombined(), StubFA()
+        topic_arm = make(StubFACombined(), "topic")
+        topic_arm._on_state(msg_in)
         states = {}
-        for name, fa, want_requests in [("combined", combined, 1), ("separate", separate, 4)]:
-            st = make(fa).read()
-            self.assertEqual(fa.requests, want_requests, name)
-            states[name] = st
-        for a, b in zip([states["combined"].q, states["combined"].dq, states["combined"].tool_pos,
-                         states["combined"].tool_R, states["combined"].force],
-                        [states["separate"].q, states["separate"].dq, states["separate"].tool_pos,
-                         states["separate"].tool_R, states["separate"].force]):
-            np.testing.assert_allclose(a, b)
-        np.testing.assert_allclose(states["combined"].force, [1.0, -0.3, 3.7])
-        self.assertEqual(states["combined"].J.shape, (6, 7))
+        for name, arm, want_requests in [("topic", topic_arm, 0),
+                                         ("get_robot_state", make(StubFACombined(), "get_robot_state"), 1),
+                                         ("separate calls", make(StubFA(), "separate calls"), 4)]:
+            states[name] = arm.read()
+            self.assertEqual(arm.fa.requests, want_requests, name)
+        for name, st in states.items():
+            np.testing.assert_allclose(st.tool_pos, (B @ D)[:3, 3], atol=1e-12, err_msg=name)
+            np.testing.assert_allclose(st.tool_R, (B @ D)[:3, :3], atol=1e-12, err_msg=name)
+            np.testing.assert_allclose(st.q, q, err_msg=name)
+            np.testing.assert_allclose(st.dq, dq, err_msg=name)
+            np.testing.assert_allclose(st.force, ft[:3], err_msg=name)
+            self.assertEqual(st.J.shape, (6, 7))
+
+        # Two reads of one message share its arrival time; a silent topic is a safety stop.
+        self.assertEqual(topic_arm.read().t, topic_arm.read().t)
+        msg, _ = topic_arm._latest
+        topic_arm._latest = (msg, fb.time.monotonic() - 2 * fb.MAX_STATE_AGE_S)
+        with self.assertRaises(fb.SafetyStop):
+            topic_arm.read()
 
     def test_samplers(self):
         rng = np.random.default_rng(1)
