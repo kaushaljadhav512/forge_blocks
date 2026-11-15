@@ -1,8 +1,8 @@
 # Test summary: FORGE peg insertion, sim to real
 
-Tests run so far (as of 2026-11-13) to get the FORGE peg-insertion policy (`Isaac-ForgeBlocks-Peg8mm-Direct-v0`,
-8 mm peg) ready for the real Franka. Everything below ran in simulation or against a fake arm. **Nothing
-has run on the real robot yet.**
+Tests run so far (as of 2026-11-14) to get the FORGE peg-insertion policy (`Isaac-ForgeBlocks-Peg8mm-Direct-v0`,
+8 mm peg) ready for the real Franka. Tests 1-5 ran in simulation or against a fake arm. Test 6 is the first
+robot session (measurements only, no insertions).
 
 | # | Test | Where | Result |
 |---|---|---|---|
@@ -11,6 +11,7 @@ has run on the real robot yet.**
 | 3 | Frame and sign measurements | mrsd26c, Isaac Lab | done, constants used in the bridge |
 | 4 | Baseline evaluation, 3 seeds | mrsd26c, Isaac Lab | 82–99% success |
 | 5 | Sim-to-real stress evaluations | mrsd26c, Isaac Lab | force offset and dead band are the risks |
+| 6 | Robot session 1 (measurements) | 16662 lab Franka, 2026-11-14 | sensing fine; **joint friction** is the new risk |
 
 ---
 
@@ -123,19 +124,34 @@ How the force perturbations are modelled:
    within the same 15 Hz tick.
 5. **Stiffness mismatch is harmless.** ±30% stiffness changes success by under 5 points.
 
+## 6. Robot session 1 (2026-11-14)
+
+Run with `deploy/run_peg.py` on the `lukas` branch. The bridge changes this session led to are described
+in [`README.md`](README.md) (Phase 2, "Lessons from the first robot session"). The lab copy had uncommitted
+edits that were discarded; the earlier `force_curve` runs and the press-test were made with that code.
+
+| Check | Result |
+|---|---|
+| Versions | Python 3.8.10, torch 2.4.1 (loads the torch 2.7 export), FrankaPy from a git checkout in the container |
+| `check` | Load setting OK (<3 N at rest, low pose); Jacobian available; topic state matches `get_pose()` exactly |
+| `rate-test` | 200 Hz stream, 100 Hz state (after the bridge fixes; 53 / 29 Hz before); policy 8 ms median, 53 ms max; 2 mm step: no motion (friction) |
+| `press-test` | force_sign −1 (earlier the same day, with code that was later discarded) |
+| `force-weights` | slope 0.73, dead band 0.13 N, sign agrees, drift 0.12 N over the test |
+| `force-scale` | estimate ≈ 1.09 × scale + 0.6 N, no dead band; scale responds from ~2.2 N commanded |
+| `force-drift` | hold within 0.15 N after taring once the stream runs (−1.74 N before the fix); controller start shifts 0.3-0.6 N; sweep: 1.5-2.4 N opposing the motion |
+| `force-curve` (earlier runs) | ~2 N to start moving, 4-5 N to move at 4 mm/s; its contact detection fires in mid-air |
+
+### Takeaways
+
+1. **The sensing risks from test 5 did not appear.** No dead band, a near-correct gain when pressing, and
+   negligible drift at rest once the tare happens after the stream starts.
+2. **Joint friction is the main gap, and the stress evals don't model it.** Small target moves (1-5 N of
+   spring pull) barely move the arm, and friction leaks into the force estimate as a force opposing
+   motion. Measure it sideways, then decide: controller change, or retrain with friction.
+
 ## Still to do on the real robot
 
-In order, using `deploy/run_peg.py`:
-
-1. Version checks on the lab PC: Python, torch (the export used 2.7.0), `pip show frankapy`.
-2. `check`: read-only state, force reading, and whether FrankaPy provides a Jacobian.
-3. `rate-test`: stream and state rates, policy inference time, and 2 mm step latency (first motion
-   and 63% of the step).
-4. `press-test`: force sign; it must read +z when pressing, as in sim (test 3).
-5. `force-curve`, then `force-scale` (kitchen scale), `force-weights` (hung masses) and `force-drift`
-   (15 s hold + 4 cm move in free space). These give the real sensing dead band, the actuation loss,
-   a second sign check, and the drift, to compare against the stress results in test 5.
-
-**Decision after step 5:** if the dead band is ≥ 2 N or the offset drifts more than ~1 N, retrain with a
-random dead band (0–5 N) and a random force offset during training (~1h45m per seed on mrsd26c).
-Otherwise, continue with the seed 2 checkpoint into the shadow and air runs (phase 4 in `README.md`).
+1. A sideways (x/y) sweep in `force_drift`, to see whether friction also fakes lateral force.
+2. Decide on friction (see takeaway 2) before any insertion.
+3. `register-hole`, then session 2 (`LAB_RUNBOOK.md`): shadow, air run, first insertions.
+4. Optional: `force-weights` at a low pose, to explain 0.73 vs 1.09.

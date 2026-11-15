@@ -147,8 +147,9 @@ These parts are new: streamed impedance targets, force tare and filtering, veloc
 the policy loop.
 
 ```
+start: stream the current pose, settle 0.5 s, then tare the force (stream_tare)
 each control tick (default 200 Hz):
-    state ← FrankaPy (pose, joints, joint velocities, O_F_ext_hat_K, Jacobian)
+    state ← latest /robot_state_publisher_node_1/robot_state message (100 Hz; Jacobian from FrankaPy)
     fingertip = tool pose + 8.7 mm along tool z;  quat sign picked like the sim
     force = ForceFilter(raw − tare)         (runner applies force_sign)
     velocity = J·q̇ moved to the fingertip  (pose difference if FrankaPy has no Jacobian)
@@ -157,6 +158,17 @@ each control tick (default 200 Hz):
     otherwise: runner.target(latest fingertip pose)
     stream the target to FrankaPy's dynamic Cartesian impedance skill (565 N/m, 28 N·m/rad)
 ```
+
+**Lessons from the first robot session (2026-11-14), now in the code:**
+- **State comes from the topic, not FrankaPy's getters.** Every getter (`get_pose`, `get_robot_state`, ...)
+  is a service request (~1.5 ms) answered from a copy that only refreshes at ~30 Hz; the topic publishes
+  at 100 Hz. `FrankaPyArm.read()` subscribes and converts `O_T_EE` exactly like `frankapy/utils.py`
+  (`reshape(4, 4).T`, times `_tool_delta_pose`); `check` compares it with `get_pose()`. It falls back to
+  `get_robot_state()` if the topic is silent, and raises `SafetyStop` if the latest message is >100 ms old.
+- **Tare after starting the stream.** Starting the impedance skill shifts the force estimate (0.3-1.7 N
+  in z, different each time). A tare before `start_stream` left that offset in every reading.
+- **Gripper:** FrankaPy's `goto_gripper(block=True)` doesn't wait for grasps (it only sleeps 2 s), so
+  `grasp`/`open` poll the width until it is still.
 
 **Check these on the lab computer before the first run:**
 
@@ -206,6 +218,15 @@ E-stop operator. State (`calibration.json`, `hole.json`, logs) goes to `deploy/r
    seated fingertip pose; the rim centre is 7.1 mm below it (32.1 mm grasp − 25 mm depth). The spread
    should be under 0.5 mm.
 
+**Results of the first run (2026-11-14):** full numbers in [`TEST_SUMMARY.md`](TEST_SUMMARY.md) (test 6).
+- Sign −1 (press-test and force-weights agree). No sensing dead band. Gain ≈ 1.09 pressing at a low
+  pose, 0.73 hanging at home (not explained yet).
+- At rest with `stream_tare`: within 0.15 N over 15 s. The stress-test risks (dead band, offset) look fine.
+- **New risk, not in the stress evals: joint friction.** About 2 N of spring pull before the arm moves,
+  4-5 N (7-8 mm of lag) to move at 4 mm/s in free air. The friction also shows up in the force estimate:
+  1.5-2.4 N opposing vertical motion, which reads as contact while descending. Sideways not measured yet.
+- Because of that lag, `force_curve` and `force_scale` detect "contact" in mid-air (`stall_m`).
+
 **Success** (Factory's definition): the peg's bottom within 2.5 mm of the hole axis and within 1 mm of
 fully seated. The bridge checks the fingertip against the registered seated pose.
 
@@ -245,10 +266,12 @@ bands, then `summary`:
 
 | Risk | Mitigation |
 |---|---|
-| Force offset or wrong sign | Robot press test; tare before each attempt; offsets above 1 N cost a lot (stress table); retrain with random offsets if the real estimate drifts |
+| Force offset or wrong sign | Sign −1 measured twice; tare after the stream starts (`stream_tare`): ±0.15 N at rest; offsets above 1 N cost a lot (stress table) |
 | Peg slipping in the grasp | 40 N grasp; the safety floor catches a peg pushed up in the fingers |
 | Real impedance controller ≠ sim controller (the sim also cancels inertia and has a dead zone) | Stiffness stress evals; the sim already randomizes stiffness by ±41% |
-| Stream or state rate too low | `rate-test` (rates and 2 mm step latency); one 67 ms step of delay costs 10–15 points in sim |
+| **Joint friction** (measured: ~2 N breakaway, 4-5 N to move slowly) | **Open.** Options: libfranka's internal impedance (`use_impedance=False`), higher stiffness (×1.3 is harmless in sim), or retrain with an actuation dead zone |
+| **Friction read as force** (measured: 1.5-2.4 N opposing vertical motion) | **Open.** Measure sideways next; retrain with a motion-opposing force term if it is there too |
+| Stream or state rate too low | Fixed: 200 Hz stream, 100 Hz state from the topic (`rate-test`); one 67 ms step of delay costs 10–15 points in sim |
 | Force estimate dead below ~5 N | `force-scale` and `force-weights` measure it; a 5 N dead band costs 20–30 points in sim; retrain with a random dead band if needed |
 | Policy file won't load on the lab computer | Check the torch version first; re-export |
 | Error in the hole registration | Repeat the hand-guided registration 5 times |

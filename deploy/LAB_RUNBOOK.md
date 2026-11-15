@@ -4,6 +4,10 @@ This is a step-by-step guide for running the robot tests. It assumes you have al
 on this robot (for example, Lab2). The background (why each test exists, what the numbers mean) is in
 [`README.md`](README.md) and [`TEST_SUMMARY.md`](TEST_SUMMARY.md); you don't need them to run this.
 
+**Status (2026-11-14):** session 1 has been run once (all of it except 1.8). Results and the open
+questions are in [`TEST_SUMMARY.md`](TEST_SUMMARY.md) (test 6). The bridge fixes from that session are on
+the `lukas` branch; use it until it is merged.
+
 There are two sessions:
 
 - **Session 1 (about 1.5 h): setup and measurements.** There are no insertions. Afterwards, send the
@@ -12,8 +16,8 @@ There are two sessions:
 
 > **Safety, every time**
 > - Two people: one runs the commands, one holds the **E-stop** the whole time the arm can move.
-> - Every command that moves the arm needs `--ack-safety` and asks you to type `YES`. Read the
->   question before you type it.
+> - Every command that moves the arm needs `--ack-safety`. Most also ask you to type `YES`, **but
+>   `rate-test` and `guide` start the moment you press Enter**: be ready before you do.
 > - Keep hands out of the workspace while the arm moves, except where a step tells you to touch it
 >   (hanging weights, guide mode).
 > - If anything looks wrong (unexpected motion, grinding, the peg slipping), press the E-stop first and
@@ -44,6 +48,18 @@ mkdir -p exports
 scp -r teamc@mrsd26c:~/forge/forge_blocks/exports/peg_forge_seed2 exports/
 ls exports/peg_forge_seed2      # policy.pt  runner_config.json  agent.yaml  env.yaml
 ```
+
+**On the 16662 lab PCs** (what worked on 2026-11-14):
+- Run all `run_peg.py` commands **inside the course Docker container** (`bash run_docker.sh`, then
+  `bash terminal_docker.sh`), from the repo under `src/devel_packages/<team>/`, which the container
+  mounts (`/home/ros_ws/src/devel_packages/<team>/forge_blocks`). FrankaPy exists only in the container.
+- Run `git pull` **on the host**, not in the container: the container has no SSH keys. If the clone's
+  remote is HTTPS, `ssh -A` won't help; switch it to `git@github.com:...` (ask your teammates first).
+- Files written from the container are owned by root. If git or `script` on the host says
+  "permission denied", run `chown -R 1001:1001 <repo>` in the container (check your host uid with `id -u`).
+  Inside the container git may need `git config --global --add safe.directory <repo>`.
+- `script` (below) runs inside the container and stops if the container closes; start it again with
+  `-a` to keep appending. Add `-f` so a teammate can follow the log live (`ssh … tail -F <log>`).
 
 Session 1 needs only numpy and FrankaPy. The policy (and torch) are needed for the timing part of
 `rate-test` and for all of session 2.
@@ -96,6 +112,12 @@ python3 deploy/run_peg.py check
 - [ ] The raw force has each axis under **3 N** while nothing touches the arm. If it is larger, check
       the load setting in Desk.
 - [ ] Write down `Jacobian from FrankaPy: yes/no`.
+- [ ] The last line says `state source: topic` with a small age and differences of ~0. If it says
+      anything else, the bridge isn't reading the 100 Hz state topic: stop and report it.
+
+On the lab robot, the at-rest force changes with the pose and with which controller ran last (0.6 N
+low, 3.7 N at home, 1.8 N at home after another command). The attempts tare after starting the
+controller, so this is expected and is not a reason to stop.
 
 ### 1.4 Rate and delay
 
@@ -116,6 +138,10 @@ python3 deploy/run_peg.py rate-test --export exports/peg_forge_seed2 --ack-safet
 
 If `send_hz` is under 120, try `--control_hz 100` once, write both results down, and carry on.
 
+On 2026-11-14 this gave `send_hz` 200, `state_update_hz` 100, policy 8 ms (median), and **no motion**
+for the 2 mm step (`null`). The step pulls with only 1.1 N, less than the joints' breakaway friction
+(~2 N), so `null` is expected on this robot. It is not a broken stream.
+
 ### 1.5 Hole base and peg
 
 1. Clamp the hole base flat on the table so that its bore is about **60 cm in front of the robot base
@@ -128,7 +154,8 @@ If `send_hz` is under 120, try `--control_hz 100` once, write both results down,
    # hold the peg vertically between the fingers: finger ENDS on the 32 mm line (hardware/README.md)
    python3 deploy/run_peg.py grasp --ack-safety
    ```
-- [ ] The printed width is about 0.008 m and the peg doesn't wiggle when you touch it lightly.
+- [ ] The printed width is about 0.008 m and the peg doesn't wiggle when you touch it lightly. The
+      lab gripper's indented fingers read **6.3-6.4 mm** on the peg, just above `grasp`'s 6 mm limit.
 
 ### 1.6 Force sign (press test)
 
@@ -148,7 +175,9 @@ the arm during this test**: a hand pressing on it gives the wrong sign.
 
 Run these in this order. Each one saves its results in `deploy/runs/`.
 
-**a) `force-curve`**: the same start as 1.6, 1–5 cm above the free spot.
+**a) `force-curve`**: the same start as 1.6, 1–5 cm above the free spot. **On the lab robot this
+test's table is not valid:** it detects contact when the arm lags 3 mm behind the target, and joint
+friction alone causes that in mid-air. Skip it unless the contact detection has been changed.
 
 ```bash
 python3 deploy/run_peg.py force-curve --ack-safety
@@ -158,7 +187,9 @@ The arm pushes into the table, increasing slowly up to 15 N, then lifts. It prin
 judge yet.
 
 **b) `force-scale`**: put the **kitchen scale** on the free spot, press **zero** on it with nothing on
-it, and move the peg 1–5 cm above the middle of the scale (`guide`).
+it, and move the peg **about 5 mm** above the middle of the scale (`guide`). Not 1–5 cm: friction makes
+the contact detection fire early, so from higher up the peg may never reach the scale. Only the
+`sensing` line is meaningful then; the `actuation` line also contains that early detection.
 
 ```bash
 python3 deploy/run_peg.py force-scale --ack-safety
@@ -187,8 +218,9 @@ It asks you to `hang the next mass and type its TOTAL grams`. Do this in order:
 4. Remove everything and type `0`.
 5. Press Enter on an empty line to finish.
 
-Hang the weights gently, let them stop swinging, then type. The arm sags a few mm under load, which is
-normal.
+Hang the weights gently, let them stop swinging, then type. The arm sags under load, which is normal:
+the spring is 565 N/m, so about 9 mm per 500 g (more with friction). A water bottle works: weigh it,
+pour some out away from the robot, weigh again, re-hang.
 
 - [ ] `sign agrees with press-test: True`. **If it says False, stop and report it.**
 - [ ] The final `0` row reads under 0.5 N.
@@ -326,14 +358,14 @@ Send the zip, the videos, the `summary` output and your notes.
 |---|---|---|
 | `check` | no | State, poses, raw force, Jacobian, calibration so far |
 | `home` | yes | FrankaPy's home pose |
-| `guide --seconds N` | by hand | Guide mode for N s |
+| `guide --seconds N` | by hand | Guide mode for N s (**starts without a YES prompt**) |
 | `open` / `grasp` | gripper | Open / close on the peg (8 mm, 40 N) |
-| `rate-test` | 2 mm | Stream rate, delay, policy time |
+| `rate-test` | 2 mm | Stream rate, delay, policy time (**starts without a YES prompt**) |
 | `press-test` | contact | Force sign → `calibration.json` |
 | `force-curve` | contact | Estimate vs commanded push, 0–15 N |
 | `force-scale` | contact | Commanded vs scale vs estimate |
 | `force-weights` | holds still | Hung masses vs estimate; second sign check |
-| `force-drift` | 4 cm, free space | Drift and pose-dependent error |
+| `force-drift` | 4 cm, free space | Drift, motion- and pose-dependent error, controller-start shift |
 | `register-hole` | by hand | Saves the hole position → `hole.json` |
 | `shadow` | by hand | Policy runs, nothing commanded |
 | `run --air` / `run --band A B` | yes | Policy attempts |
@@ -352,3 +384,7 @@ Everything is saved in `deploy/runs/`:
   stop.
 - `no contact within the descent limit`: the surface is more than 6–8 cm below the peg. Start lower.
 - `operator cancelled`: you typed something other than `YES`. Run the command again.
+- `unexpected peg grasp width 0.045 m`: an old bridge read the width while the fingers were still
+  closing (FrankaPy's `goto_gripper` doesn't wait for grasps). Fixed on `lukas`; pull it.
+- `robot state is … ms old`: the state topic stopped. Check the three FrankaPy terminals.
+- `run_peg.py check` prints only its own arguments: someone edited the lab copy. Check `git status`.

@@ -7,8 +7,9 @@ inserting a block into a 3D-printed slot on the Franka. This is the baseline for
 It is an add-on package for **Isaac Lab v2.3.2**. It subclasses FORGE (`isaaclab_tasks/direct/forge`)
 and does not modify Isaac Lab, so upstream code stays pinned and untouched.
 
-**Status:** the unit tests pass, but nothing that needs Isaac Sim has been run yet. Start with
-`scripts/preflight.py`, and expect to fix problems on the first run.
+**Status:** the peg policy is trained and exported. The first robot session (measurements, no
+insertions) was on 2026-11-14; results are in [deploy/TEST_SUMMARY.md](deploy/TEST_SUMMARY.md) (test 6).
+The bridge fixes from that session are on the `lukas` branch.
 
 ## Differences from upstream FORGE
 
@@ -47,6 +48,7 @@ These remain different from the paper:
 | `scripts/export_policy.py` | either | Checkpoint → `policy.pt` (TorchScript, includes the obs normaliser) + `runner_config.json` |
 | `scripts/sim_bridge_test.py` | training PC | Drives the sim through the deploy runner; checks obs, actions and targets match the env |
 | `deploy/policy_runner.py` | laptop / robot PC | numpy + torch only. Builds observations and turns policy output into pose targets |
+| `deploy/franka_bridge.py`, `run_peg.py` | robot PC (16662 Docker container) | FrankaPy bridge, safety checks and the robot test commands |
 | `tests/` | anywhere | `python -m unittest discover -s tests` |
 
 ### Task IDs
@@ -141,9 +143,9 @@ Copy `exports/<name>/` to the laptop or robot PC with `scp`, or attach it to a G
 The plan for running the peg policy on the Franka is in [deploy/README.md](deploy/README.md). The
 peg, hole and jig to make are in [hardware/README.md](hardware/README.md).
 
+The bridge is `deploy/franka_bridge.py` (command line: `deploy/run_peg.py`); lab steps are in
+[deploy/LAB_RUNBOOK.md](deploy/LAB_RUNBOOK.md).
+
 ## Not yet written
 
-- The FrankaPy bridge (Phase 5): read the robot state, filter force with `ForceFilter`, call
-  `ForgePolicyRunner.step` at 15 Hz, and stream the fingertip target to the Cartesian impedance
-  controller. Convert from the fingertip midpoint to FrankaPy's end-effector frame first.
 - The paper's ablations (No Force, No DR, No FP) and the IndustReal baseline.
