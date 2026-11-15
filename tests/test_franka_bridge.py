@@ -369,6 +369,41 @@ class TestCalibration(unittest.TestCase):
         with self.assertRaises(fb.SafetyStop):
             topic_arm.read()
 
+    def test_grasp_waits_for_the_fingers(self):
+        # FrankaPy returns from goto_gripper after ~2 s while the fingers are still closing; the width
+        # must be read only once they stop.
+        clock = {"t": 0.0}
+
+        class StubFA:
+            def goto_gripper(self, **kw):
+                self.t0, self.target = clock["t"], 0.0064  # the indented fingers stop at 6.4 mm on the peg
+
+            def open_gripper(self, block=True):
+                self.t0, self.target = clock["t"], 0.08
+
+            def get_gripper_width(self):  # 72.5 mm at the start, 2 cm/s towards the target
+                start = 0.0725 if self.target < 0.07 else 0.0064
+                step = 0.02 * (clock["t"] - self.t0)
+                return max(self.target, start - step) if self.target < start else min(self.target, start + step)
+
+        arm = fb.FrankaPyArm.__new__(fb.FrankaPyArm)
+        arm.fa = StubFA()
+        fake_clock = lambda: clock["t"]  # noqa: E731
+
+        def fake_sleep(dt):
+            clock["t"] += dt
+
+        def settled(**kw):
+            return fb.FrankaPyArm.wait_gripper_settled(arm, clock=fake_clock, sleep=fake_sleep, **kw)
+
+        arm.wait_gripper_settled = settled
+        self.assertAlmostEqual(arm.grasp(), 0.0064)
+        self.assertGreater(clock["t"], 3.3)  # (72.5 - 6.4) mm at 2 cm/s, then 0.5 s still
+        self.assertAlmostEqual(arm.open(), 0.08)
+        with self.assertRaises(fb.HardwareError):
+            arm.fa.goto_gripper()
+            settled(timeout_s=1.0)  # still closing after 1 s
+
     def test_samplers(self):
         rng = np.random.default_rng(1)
         for _ in range(200):

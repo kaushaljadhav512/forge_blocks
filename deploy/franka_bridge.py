@@ -314,14 +314,34 @@ class FrankaPyArm:
             width=width, grasp=True, speed=0.02, force=force, epsilon_inner=0.004, epsilon_outer=0.004, block=True,
             ignore_errors=False,
         )
-        got = float(self.fa.get_gripper_width())
+        got = self.wait_gripper_settled()
         if not 0.006 <= got <= 0.010:
             raise HardwareError(f"unexpected peg grasp width {got:.4f} m")
         return got
 
     def open(self) -> float:
         self.fa.open_gripper(block=True)
-        return float(self.fa.get_gripper_width())
+        return self.wait_gripper_settled()
+
+    def wait_gripper_settled(self, timeout_s=10.0, still_s=0.5, tol_m=0.0002, clock=time.monotonic, sleep=time.sleep):
+        """Gripper width once the fingers stop moving.
+
+        FrankaPy's goto_gripper(block=True) doesn't wait for grasp or move goals: it never records them as
+        the last gripper command, so wait_for_gripper() just sleeps 2 s. Closing from fully open to the
+        peg at 2 cm/s takes over 3 s, so the width was read mid-motion (~45 mm in the lab)."""
+        end = clock() + timeout_s
+        last, still_since = None, None
+        while clock() < end:
+            w, now = float(self.fa.get_gripper_width()), clock()
+            if last is not None and abs(w - last) < tol_m:
+                still_since = now if still_since is None else still_since
+                if now - still_since >= still_s:
+                    return w
+            else:
+                still_since = None
+            last = w
+            sleep(0.1)
+        raise HardwareError(f"gripper still moving after {timeout_s:.0f} s (width {last:.4f} m)")
 
     def guide(self, duration, block=True):
         """Hand-guiding (zero-stiffness) mode."""
