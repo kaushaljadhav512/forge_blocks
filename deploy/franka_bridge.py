@@ -450,11 +450,25 @@ class BridgeConfig:
 
 
 def tare_force(arm, seconds, hz=200.0, clock=time.monotonic, sleep=time.sleep) -> np.ndarray:
-    """Mean raw force over `seconds` in free space; subtract it for the rest of the attempt."""
+    """Mean raw force over `seconds` in free space; subtract it for the rest of the attempt.
+    Only for when no stream is running; with one, use stream_tare."""
     samples, end = [], clock() + seconds
     while clock() < end:
         samples.append(arm.read().force)
         sleep(1.0 / hz)
+    return np.mean(samples, axis=0)
+
+
+STREAM_SETTLE_S = 0.5  # after start_stream, before taring
+
+
+def stream_tare(arm, tool_pos, R, cfg: BridgeConfig, clock=time.monotonic, sleep=time.sleep) -> np.ndarray:
+    """Tare with the streaming controller already running (call right after start_stream, holding
+    tool_pos). Starting the impedance skill shifts the force estimate: ~1.7 N in z on the lab robot
+    (force-drift, 2026-11-14), which a tare taken before start_stream leaves in every reading."""
+    _hold(arm, tool_pos, R, cfg, STREAM_SETTLE_S, clock, sleep)
+    samples = []
+    _hold(arm, tool_pos, R, cfg, cfg.tare_s, clock, sleep, samples=samples)
     return np.mean(samples, axis=0)
 
 
@@ -478,22 +492,24 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
     rc = runner.cfg
     safety = SafetyMonitor(limits, rim, hole_est)
 
-    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
-    st = arm.read()
-    tip, quat, R = tip_pose(st, cfg)
-    runner.reset(tip, quat, hole_est)
-    ff = ForceFilter(rc.ft_smoothing_factor, rc.sim_dt)
-    ff.reset()
-
     result = {"outcome": None, "success": False, "time_to_success_s": None, "time_to_prediction_s": None,
               "peak_force_smooth_N": 0.0, "mean_force_smooth_N": 0.0, "policy_steps": 0, "error": None,
-              "tare_N": tare.tolist(), "hole_est": hole_est.tolist(), "hole_rim": rim.tolist()}
+              "tare_N": None, "hole_est": hole_est.tolist(), "hole_rim": rim.tolist()}
     max_steps = int(round(cfg.timeout_s / rc.policy_dt))
-    arm.start_stream(st.tool_pos, st.tool_R, cfg.stiffness, max_duration=cfg.timeout_s + 5.0)
-    t0 = clock()
-    next_policy, next_tick = t0, t0
     prev, prev_now, force_sum, ticks = None, None, 0.0, 0
+    st = arm.read()
+    hold_tool, hold_R = st.tool_pos.copy(), st.tool_R.copy()
+    arm.start_stream(hold_tool, hold_R, cfg.stiffness, max_duration=cfg.timeout_s + STREAM_SETTLE_S + cfg.tare_s + 5.0)
     try:
+        tare = stream_tare(arm, hold_tool, hold_R, cfg, clock, sleep)
+        result["tare_N"] = tare.tolist()
+        st = arm.read()
+        tip, quat, R = tip_pose(st, cfg)
+        runner.reset(tip, quat, hole_est)
+        ff = ForceFilter(rc.ft_smoothing_factor, rc.sim_dt)
+        ff.reset()
+        t0 = clock()
+        next_policy, next_tick = t0, t0
         while True:
             st = arm.read()
             now = clock()
@@ -575,12 +591,12 @@ def press_test(arm, cfg: BridgeConfig, descend_m_s=0.005, max_descent=0.06, stop
                sleep=time.sleep):
     """Lower the held peg onto a free flat surface below until the force builds up, then report the
     raw force z. The sim reads +z for this press, so force_sign = sign(raw z). Starts at the current pose."""
-    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
     st = arm.read()
     start, R = st.tool_pos.copy(), st.tool_R.copy()
-    arm.start_stream(start, R, cfg.stiffness, max_duration=max_descent / descend_m_s + 10)
-    t0, pressed, contact = clock(), [], None
+    arm.start_stream(start, R, cfg.stiffness, max_duration=max_descent / descend_m_s + 12)
     try:
+        tare = stream_tare(arm, start, R, cfg, clock, sleep)
+        t0, pressed, contact = clock(), [], None
         while True:
             st = arm.read()
             f = st.force - tare
@@ -679,13 +695,14 @@ def force_curve(arm, cfg: BridgeConfig, descend_m_s=0.004, max_descent=0.08, sta
     A clean sensor follows the commanded line; a dead band reads ~0 up to its width.
     """
     k = cfg.stiffness[2]
-    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
     st = arm.read()
     start_tool, R = st.tool_pos.copy(), st.tool_R.copy()
     start_tip = tool_to_tip(start_tool, R, cfg.tip_offset)
-    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=max_descent / descend_m_s + 10)
-    t0, samples, contact_t = clock(), [], None
+    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=max_descent / descend_m_s + 12)
+    samples, contact_t = [], None
     try:
+        tare = stream_tare(arm, start_tool, R, cfg, clock, sleep)
+        t0 = clock()
         while True:
             t = clock() - t0
             depth = descend_m_s * t
@@ -791,13 +808,13 @@ def force_scale(arm, cfg: BridgeConfig, levels_N=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 
         scale -> estimate  : sensing error (the TA's "unreliable below ~5 N")
     Start with the peg 1-5 cm above the scale, scale zeroed."""
     k = cfg.stiffness[2]
-    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
     st = arm.read()
     start_tool, R = st.tool_pos.copy(), st.tool_R.copy()
     start_tip = tool_to_tip(start_tool, R, cfg.tip_offset)
     arm.start_stream(start_tool, R, cfg.stiffness, max_duration=3600)
-    rows = []
+    rows, tare = [], np.zeros(3)
     try:
+        tare = stream_tare(arm, start_tool, R, cfg, clock, sleep)
         # Down until the fingertip stalls on the scale (from position, so a sensing dead band can't hide it).
         t0 = clock()
         while True:
@@ -883,16 +900,17 @@ def force_weights(arm, cfg: BridgeConfig, ask_mass=input, direction=(0.0, 0.0, -
 
 def force_drift(arm, cfg: BridgeConfig, hold_s=15.0, sweep_m=0.04, sweep_m_s=0.01, max_force_N=10.0,
                 clock=time.monotonic, sleep=time.sleep):
-    """Tare like an attempt does, then (1) hold still for hold_s and (2) move straight down sweep_m and
+    """Tare like an attempt does (stream running), then (1) hold still for hold_s and (2) move straight down sweep_m and
     back, all in free space. Nothing touches the peg, so every reading is error: (1) is drift over an
     attempt's duration, (2) is the pose-dependent error over an attempt's range of motion. The sim
     loses a few points at 1 N of offset and 10-20 at 2 N. Needs sweep_m + 1 cm of free space below."""
-    tare = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)
+    pre_stream = tare_force(arm, cfg.tare_s, cfg.control_hz, clock, sleep)  # what the old code tared on
     st = arm.read()
     start_tool, R = st.tool_pos.copy(), st.tool_R.copy()
-    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=hold_s + 2 * sweep_m / sweep_m_s + 10)
-    hold, sweep = [], []
+    arm.start_stream(start_tool, R, cfg.stiffness, max_duration=hold_s + 2 * sweep_m / sweep_m_s + 12)
+    hold, sweep, tare = [], [], np.zeros(3)
     try:
+        tare = stream_tare(arm, start_tool, R, cfg, clock, sleep)
         t0 = clock()
         while clock() - t0 < hold_s:
             st = arm.read()
@@ -922,6 +940,11 @@ def force_drift(arm, cfg: BridgeConfig, hold_s=15.0, sweep_m=0.04, sweep_m_s=0.0
         "hold_end_mean_N": hf[ht > hold_s - 1.0].mean(axis=0).tolist(),
         "hold_slope_N_per_s": [float(np.polyfit(ht, hf[:, i], 1)[0]) for i in range(3)],
         "hold_std_N": hf.std(axis=0).tolist(),
+        # starting the controller moves the estimate by this much; the old tare-before-stream kept it
+        "stream_start_shift_N": (tare - pre_stream).tolist(),
+        "tare_N": tare.tolist(),
+        "hold_series": [[round(float(t), 4)] + [round(float(x), 4) for x in f] for t, f in hold],  # t, fx, fy, fz
+        "sweep_series": [[round(float(z), 5)] + [round(float(x), 4) for x in f] for z, f in sweep],  # dz, fx, fy, fz
     }
     if sweep:
         sz = np.array([z for z, _ in sweep])

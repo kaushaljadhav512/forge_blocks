@@ -24,7 +24,7 @@ RIM = np.array([0.59, 0.0, 0.028])
 
 class FakeArm:
     def __init__(self, raw_sign=1.0, bias=(0.0, 0.0, 0.0), tau=0.1, R=fb.DOWN, spike_at=None, sense_deadband=0.0,
-                 act_deadband=0.0, drift=(0.0, 0.0, 0.0), z_gain=(0.0, 0.0, 0.0)):
+                 act_deadband=0.0, drift=(0.0, 0.0, 0.0), z_gain=(0.0, 0.0, 0.0), stream_shift=(0.0, 0.0, 0.0)):
         self.t = 0.0
         self.tip = RIM + np.array([0.0, 0.0, fb.START_ABOVE_RIM])
         self.z0 = None  # z_gain reference: the first tip height read
@@ -35,6 +35,7 @@ class FakeArm:
         self.target = None
         self.raw_sign, self.bias, self.tau, self.spike_at = raw_sign, np.array(bias), tau, spike_at
         self.sense_deadband = sense_deadband
+        self.stream_shift = np.array(stream_shift)  # estimate moves while the impedance skill runs (lab: ~1.7 N z)
         self.streaming, self.sent, self.streams = False, 0, 0
 
     # virtual time
@@ -69,6 +70,8 @@ class FakeArm:
         f = self.env_force() + self.ext_load
         f = np.sign(f) * np.clip(np.abs(f) - self.sense_deadband, 0.0, None)  # unreliable small forces
         f = self.raw_sign * f + self.bias + self.drift * self.t + self.z_gain * (self.tip[2] - self.z0)
+        if self.streaming:
+            f = f + self.stream_shift
         if self.spike_at is not None and self.t > self.spike_at:
             f = f + np.array([0.0, 0.0, 100.0])
         return fb.RobotState(t=self.t, q=np.zeros(7), dq=np.zeros(7), tool_pos=fb.tip_to_tool(self.tip, self.R),
@@ -276,6 +279,28 @@ class TestCalibration(unittest.TestCase):
         self.assertAlmostEqual(out["sweep_slope_N_per_cm"][2], 0.2, delta=0.02)
         self.assertAlmostEqual(out["sweep_max_abs_N"][2], 0.8, delta=0.1)
         self.assertLess(abs(out["hold_end_mean_N"][0]), 0.01)  # constant bias is removed by the tare
+
+    def test_tare_after_stream_start_removes_controller_shift(self):
+        shift = np.array([0.0, 0.0, -1.7])
+        arm = FakeArm(stream_shift=shift)
+        out = fb.force_drift(arm, fb.BridgeConfig(tare_s=0.05), hold_s=1.0, sweep_m=0.01, sweep_m_s=0.04,
+                             clock=arm.clock, sleep=arm.sleep)
+        np.testing.assert_allclose(out["stream_start_shift_N"], shift, atol=1e-9)
+        np.testing.assert_allclose(out["hold_end_mean_N"], 0.0, atol=1e-9)  # tared before the stream: -1.7 N
+        self.assertEqual(len(out["hold_series"][0]), 4)
+        # The attempt loop tares the same way: no false force while hovering in free space.
+        arm = FakeArm(stream_shift=shift)
+        arm.tip = RIM + np.array([0.0, 0.0, 0.10])
+
+        class HoverRunner(ForgePolicyRunner):  # target = the estimate = where the arm already is
+            def _run_policy(self, obs):
+                mu = np.zeros(7)
+                mu[5], mu[6] = self.actions[5], -1.0
+                return mu
+
+        res, _ = attempt(arm, HoverRunner(make_cfg()), est=RIM + np.array([0.0, 0.0, 0.10]), timeout_s=0.5)
+        np.testing.assert_allclose(res["tare_N"], shift, atol=1e-9)
+        self.assertLess(res["peak_force_smooth_N"], 0.05)
 
     def test_force_drift_stops_on_contact(self):
         arm = FakeArm()

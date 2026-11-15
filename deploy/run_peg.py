@@ -255,6 +255,7 @@ def main(argv=None):
         if "sweep_max_abs_N" in out:
             print("sweep: max |f| (N)         ", fmt(out["sweep_max_abs_N"]))
             print("sweep: change per cm (N/cm)", fmt(out["sweep_slope_N_per_cm"]))
+        print("controller start shift (N) ", fmt(out["stream_start_shift_N"]), "  (removed by taring after it)")
         print(f"worst |f| anywhere: {out['worst_norm_N']:.2f} N")
         print("sim budget: under ~1 N of offset costs a few points; 2 N costs 10-20")
         save_check(args.dir, "force_drift", out)
