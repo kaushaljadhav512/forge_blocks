@@ -46,7 +46,19 @@ def make_upstream_stub():
             self.prev_fingertip_pos = self.noisy_fingertip_pos.clone()
             self.ee_angvel_fd = torch.zeros(1, 3)
 
+        def generate_ctrl_signals(
+            self, ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, ctrl_target_gripper_dof_pos
+        ):
+            self.ctrl_calls = getattr(self, "ctrl_calls", 0) + 1
+            # FactoryEnv: the controller's wrench and torques, then set_joint_effort_target.
+            self.applied_wrench = getattr(self, "stub_wrench", torch.zeros(1, 6))
+            self.joint_torque = torch.zeros(1, 9)
+            if hasattr(self, "_robot"):
+                self._robot.set_joint_effort_target(self.joint_torque)
+
         def randomize_initial_state(self, env_ids):
+            if hasattr(self, "_robot"):  # Factory moves the hand to its start pose with the controller
+                self.generate_ctrl_signals(self.true_pos, self.quat, 0.0)
             self.init_fixed_pos_obs_noise = torch.full((1, 3), 0.0025)
             self.ee_linvel_fd = torch.zeros(1, 3)
             self.ee_angvel_fd = torch.zeros(1, 3)
@@ -205,6 +217,187 @@ class TestForgeBlocksEnv(unittest.TestCase):
         self.assertLessEqual(sizes.max().item(), 3.0)
         self.assertAlmostEqual(sizes.mean().item(), 2.0, delta=0.1)
         self.assertFalse(torch.equal(sizes[:, 0], sizes[:, 1]))  # independent axes
+
+    def _pull_env(self, alpha, offset=(0.0, 0.0), ema=1.0):
+        env = self._leak_env([0.0, 0.0], alpha=ema)
+        env.cfg.obs_rand.ft_pull_leak_alpha = list(alpha)
+        env.cfg.obs_rand.ft_pull_leak_offset_N = list(offset)
+        env.task_prop_gains = torch.tensor([[565.0, 565.0, 565.0, 28.0, 28.0, 28.0]])
+        env.fingertip_midpoint_pos = torch.zeros(1, 3)
+        return env
+
+    def _command(self, env, target):
+        env.generate_ctrl_signals(
+            ctrl_target_fingertip_midpoint_pos=torch.tensor([target]),
+            ctrl_target_fingertip_midpoint_quat=torch.tensor([DOWN]),
+            ctrl_target_gripper_dof_pos=0.0,
+        )
+
+    def test_pull_leak_is_off_by_default(self):
+        env = self._pull_env([0.0, 0.0])
+        env.randomize_initial_state(torch.tensor([0]))
+        self._command(env, [0.01, 0.0, 0.0])
+        env._compute_intermediate_values(DT)
+        self.assertEqual(env.noisy_force.abs().max().item(), 0.0)
+        self.assertEqual(env.ctrl_calls, 1)  # still reaches the upstream controller
+
+    def test_pull_leak_opposes_the_pull(self):
+        env = self._pull_env([0.4, 0.4])
+        env.randomize_initial_state(torch.tensor([0]))
+        self._command(env, [0.004, 0.0, -0.002])  # hand stuck at 0: pull 2.26 N in +x, -1.13 N in z
+        env._compute_intermediate_values(DT)
+        torch.testing.assert_close(env.controller_pull(), torch.tensor([[2.26, 0.0, -1.13]]), atol=1e-4, rtol=0)
+        torch.testing.assert_close(env.noisy_force, torch.tensor([[-0.904, 0.0, 0.452]]), atol=1e-4, rtol=0)
+        env.fingertip_midpoint_pos = torch.tensor([[0.004, 0.0, -0.002]])  # the hand catches up
+        env._compute_intermediate_values(DT)
+        self.assertLess(env.noisy_force.abs().max().item(), 1e-6)
+
+    def test_pull_uses_each_episodes_gains(self):
+        env = self._pull_env([0.5, 0.5])
+        env.randomize_initial_state(torch.tensor([0]))
+        env.task_prop_gains = torch.tensor([[300.0, 600.0, 900.0, 28.0, 28.0, 28.0]])
+        self._command(env, [0.01, 0.01, 0.01])
+        torch.testing.assert_close(env.controller_pull(), torch.tensor([[3.0, 6.0, 9.0]]), atol=1e-4, rtol=0)
+
+    def test_reset_clears_the_pull(self):
+        env = self._pull_env([0.4, 0.4])
+        env.randomize_initial_state(torch.tensor([0]))
+        self._command(env, [0.3, 0.0, 0.0])  # e.g. the reset's own motion
+        env.randomize_initial_state(torch.tensor([0]))
+        env._compute_intermediate_values(DT)
+        self.assertEqual(env.controller_pull().abs().max().item(), 0.0)
+        self.assertEqual(env.noisy_force.abs().max().item(), 0.0)
+
+    def test_pull_leak_offset_and_smoothing(self):
+        env = self._pull_env([0.0, 0.0], offset=(-1.0, -1.0), ema=0.25)
+        env.randomize_initial_state(torch.tensor([0]))
+        env._compute_intermediate_values(DT)
+        torch.testing.assert_close(env.noisy_force, torch.full((1, 3), -0.25), atol=1e-6, rtol=0)
+        for _ in range(60):
+            env._compute_intermediate_values(DT)
+        torch.testing.assert_close(env.noisy_force, torch.full((1, 3), -1.0), atol=1e-4, rtol=0)
+        env.randomize_initial_state(torch.tensor([0]))
+        self.assertEqual(env._leak_smooth.abs().max().item(), 0.0)
+
+    def test_pull_leak_draws_in_range_per_axis(self):
+        env = self._pull_env([0.2, 0.45], offset=(-1.5, 0.0))
+        alphas, offsets = [], []
+        for _ in range(200):
+            env.randomize_initial_state(torch.tensor([0]))
+            alphas.append(env._pull_alpha.clone())
+            offsets.append(env._leak_offset.clone())
+        alphas, offsets = torch.cat(alphas), torch.cat(offsets)
+        self.assertGreaterEqual(alphas.min().item(), 0.2)
+        self.assertLessEqual(alphas.max().item(), 0.45)
+        self.assertGreaterEqual(offsets.min().item(), -1.5)
+        self.assertLessEqual(offsets.max().item(), 0.0)
+        self.assertFalse(torch.equal(alphas[:, 0], alphas[:, 1]))  # independent axes
+
+    def test_speed_and_pull_leaks_add(self):
+        env = self._pull_env([0.4, 0.4])
+        env.cfg.obs_rand.ft_force_leak_N = [2.0, 2.0]
+        env.randomize_initial_state(torch.tensor([0]))
+        env.fingertip_midpoint_linvel = torch.tensor([[0.02, 0.0, 0.0]])  # speed leak ~ -2 N in x
+        self._command(env, [0.004, 0.0, 0.0])  # pull leak -0.904 N in x
+        env._compute_intermediate_values(DT)
+        self.assertAlmostEqual(env.noisy_force[0, 0].item(), -2.904, places=3)
+
+
+    def _friction_env(self, lo, hi):
+        env = self.env
+        env.num_envs = 1
+        env.cfg.ctrl = types.SimpleNamespace(task_friction_lo_N=list(lo), task_friction_hi_N=list(hi))
+        env.physics_dt = DT
+        J = torch.zeros(1, 6, 7)
+        J[0, 0, 0] = J[0, 1, 1] = J[0, 2, 2] = 1.0  # joint i moves the fingertip along axis i
+        env.fingertip_midpoint_jacobian = J
+        env.arm_mass_matrix = 2.0 * torch.eye(7).unsqueeze(0)
+        env.fingertip_midpoint_linvel = torch.zeros(1, 3)
+        env.fingertip_midpoint_pos = torch.zeros(1, 3)
+        env.efforts = []
+        env._robot = types.SimpleNamespace(set_joint_effort_target=lambda t: env.efforts.append(t.clone()))
+        env._compute_intermediate_values(DT)
+        return env
+
+    def _ctrl(self, env, wrench):
+        env.stub_wrench = torch.tensor([list(wrench) + [0.0, 0.0, 0.0]])
+        env.efforts.clear()
+        env.generate_ctrl_signals(torch.zeros(1, 3), torch.tensor([DOWN]), 0.0)
+        return env.efforts[-1][0, 0:3]
+
+    def test_friction_is_off_by_default(self):
+        env = self._friction_env([0.0] * 6, [0.0] * 6)
+        env.randomize_initial_state(torch.tensor([0]))
+        self.assertIsNone(env._task_friction)
+        torch.testing.assert_close(self._ctrl(env, [3.0, 0.0, 0.0]), torch.zeros(3))
+        self.assertEqual(len(env.efforts), 1)
+
+    def test_friction_holds_a_small_push_and_limits_a_large_one(self):
+        f = [4.6, 1.9, 1.5, 2.0, 2.1, 1.0]
+        env = self._friction_env(f, f)
+        env.randomize_initial_state(torch.tensor([0]))
+        # At rest: 3 N in +x is below x+ friction (held); 3 N in -y is above y- friction (2 N slides).
+        torch.testing.assert_close(self._ctrl(env, [3.0, -3.0, 0.0]), torch.tensor([-3.0, 2.0, 0.0]))
+        # Moving fast in -x: friction pushes +x with x- friction (1.9 N), whatever the push.
+        env.fingertip_midpoint_linvel = torch.tensor([[-0.02, 0.0, 0.0]])
+        torch.testing.assert_close(self._ctrl(env, [0.0, 0.0, 0.0]), torch.tensor([1.9, 0.0, 0.0]))
+
+    def test_friction_is_not_applied_during_reset(self):
+        f = [3.0] * 6
+        env = self._friction_env(f, f)
+        env.randomize_initial_state(torch.tensor([0]))  # allocates
+        env.stub_wrench = torch.tensor([[2.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+        env.efforts.clear()
+        env.randomize_initial_state(torch.tensor([0]))  # the stub's reset calls the controller
+        self.assertEqual(len(env.efforts), 1)  # only FactoryEnv's own call, no friction re-send
+        torch.testing.assert_close(self._ctrl(env, [2.0, 0.0, 0.0])[0], torch.tensor(-2.0))  # after reset: on
+
+    def test_friction_draws_per_direction_in_range(self):
+        env = self._friction_env([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [2.0, 0.5, 0.0, 0.0, 0.0, 3.0])
+        draws = []
+        for _ in range(200):
+            env.randomize_initial_state(torch.tensor([0]))
+            draws.append(env._task_friction.clone())
+        d = torch.cat(draws)
+        self.assertGreaterEqual(d[:, 0].min().item(), 1.0)
+        self.assertLessEqual(d[:, 0].max().item(), 2.0)
+        self.assertLessEqual(d[:, 1].max().item(), 0.5)
+        self.assertEqual(d[:, 2:5].abs().max().item(), 0.0)
+        self.assertGreater(d[:, 5].std().item(), 0.5)
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class TestCoulombFriction(unittest.TestCase):
+    def setUp(self):
+        from forge_blocks.observation import coulomb_friction
+
+        self.f = coulomb_friction
+        self.mass = 2.0 * torch.eye(3).unsqueeze(0)
+        self.plus = torch.tensor([[4.0, 4.0, 4.0]])
+        self.minus = torch.tensor([[1.0, 1.0, 1.0]])
+
+    def test_sticks_below_the_limit(self):
+        out = self.f(torch.tensor([[3.0, -0.5, 0.0]]), torch.zeros(1, 3), self.mass, DT, self.plus, self.minus)
+        torch.testing.assert_close(out, torch.tensor([[-3.0, 0.5, 0.0]]))
+
+    def test_slides_at_the_directional_limit(self):
+        out = self.f(torch.tensor([[6.0, -3.0, 0.0]]), torch.zeros(1, 3), self.mass, DT, self.plus, self.minus)
+        torch.testing.assert_close(out, torch.tensor([[-4.0, 1.0, 0.0]]))
+
+    def test_stops_a_slow_hand_without_reversing_it(self):
+        # 0.1 mm/s with 2 kg: 0.024 N stops it within one 1/120 s step; friction gives exactly that.
+        v = torch.tensor([[0.0001, 0.0, 0.0]])
+        out = self.f(torch.zeros(1, 3), v, self.mass, DT, self.plus, self.minus)
+        self.assertAlmostEqual(out[0, 0].item(), -2.0 * 0.0001 / DT, places=6)
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class TestPullLeak(unittest.TestCase):
+    def test_shape(self):
+        from forge_blocks.observation import pull_leak
+
+        out = pull_leak(torch.tensor([[2.0, -4.0, 0.0]]), torch.tensor([[0.25, 0.5, 0.4]]))
+        torch.testing.assert_close(out, torch.tensor([[-0.5, 2.0, 0.0]]))
 
 
 @unittest.skipIf(torch is None, "needs torch")

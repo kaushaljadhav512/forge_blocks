@@ -73,6 +73,33 @@ def friction_leak(linvel: torch.Tensor, leak_N: torch.Tensor, v_smooth: float) -
     return -leak_N * torch.tanh(linvel / v_smooth)
 
 
+def pull_leak(pull: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """Fake force tied to how hard the controller pulls: -alpha * pull per axis, where pull = task
+    stiffness x (target - fingertip), the spring force the impedance controller commands.
+
+    Fitted on the session-2 friction walks (2026-11-16): while joint friction holds the hand back, a
+    share alpha of the pull (~0.25 in y, ~0.35 in z, ~0.4 in x) shows up in O_F_ext_hat_K against it,
+    like a contact ahead. It held on a hold-out walk, unlike friction_leak's speed model, and follows the
+    friction wherever it is large, including at rest while the hand is stuck.
+    """
+    return -alpha * pull
+
+
+def coulomb_friction(push: torch.Tensor, linvel: torch.Tensor, task_mass: torch.Tensor, dt: float,
+                     f_plus: torch.Tensor, f_minus: torch.Tensor) -> torch.Tensor:
+    """Task-space Coulomb friction on the fingertip for one physics step, (n, 3) [N].
+
+    push: (n, 3) the other forces on the fingertip this step (the controller's wrench); linvel: (n, 3);
+    task_mass: (n, 3, 3) translational task-space inertia; f_plus / f_minus: (n, 3) friction magnitude
+    when moving (or pushed) in +axis / -axis. The force that would stop the fingertip within this step is
+    hold = -(push + task_mass @ v / dt). Friction supplies it when it is within the limits (the hand sticks:
+    a push below the friction doesn't move it) and saturates otherwise (the hand slides against
+    f_plus or f_minus). An explicit -F sign(v) would overshoot and chatter at the sim's 120 Hz.
+    """
+    hold = -(push + (task_mass @ linvel.unsqueeze(-1)).squeeze(-1) / dt)
+    return torch.maximum(torch.minimum(hold, f_minus), -f_plus)
+
+
 def force_deadband(force: torch.Tensor, deadband: float, mode: str = "axis") -> torch.Tensor:
     """Shrink the observed force toward zero by `deadband` N; anything smaller reads 0.
 

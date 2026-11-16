@@ -21,7 +21,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.direct.factory.factory_tasks_cfg import FixedAssetCfg, HeldAssetCfg
-from isaaclab_tasks.direct.forge.forge_env_cfg import ForgeEnvCfg, ForgeObsRandCfg, ForgeTaskPegInsertCfg
+from isaaclab_tasks.direct.forge.forge_env_cfg import ForgeCtrlCfg, ForgeEnvCfg, ForgeObsRandCfg, ForgeTaskPegInsertCfg
 from isaaclab_tasks.direct.forge.forge_tasks_cfg import ForgePegInsert
 
 from forge_blocks import geometry as g
@@ -49,6 +49,25 @@ class BlockObsRandCfg(ForgeObsRandCfg):
     # range in N, and the speed in m/s at which it reaches ~76% of that size (tanh(1)).
     ft_force_leak_N: list = [0.0, 0.0]
     ft_force_leak_v_mps: float = 0.002
+    # Friction leak tied to the controller's pull (see block_env.py; fitted on the session-2 walks):
+    # fake force = offset - alpha * stiffness * (target - fingertip), per axis. Per episode and axis,
+    # alpha ~ U(ft_pull_leak_alpha) and offset ~ U(ft_pull_leak_offset_N) in N (signed). Both off by
+    # default. The walks gave alpha 0.25-0.43 and offsets near -1 N in x and z. Train with FORGE's
+    # actuation dead zone widened in x (env.ctrl.default_dead_zone), or the sim hand follows its target
+    # and there is little pull to leak.
+    ft_pull_leak_alpha: list = [0.0, 0.0]
+    ft_pull_leak_offset_N: list = [0.0, 0.0]
+
+
+@configclass
+class BlockCtrlCfg(ForgeCtrlCfg):
+    # Task-space Coulomb friction at the fingertip (see block_env.py), standing in for the real Franka's
+    # joint friction. Per episode, each of [x+, x-, y+, y-, z+, z-] (the friction when moving or pushed
+    # that way) is drawn from U(lo, hi) in N. Off by default. The session-2 walks lagged as if
+    # ~4.6 / 1.9 N in x, ~1.5 / 2.0 N in y, ~2 / 1 N in z. Set FORGE's dead zone (default_dead_zone)
+    # to 0 when using it, since that was its stand-in.
+    task_friction_lo_N: list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    task_friction_hi_N: list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 @configclass
@@ -99,6 +118,7 @@ class ForgeBlockEnvCfg(ForgeEnvCfg):
     task_name = "peg_insert"
     episode_length_s = 10.0
     obs_rand: BlockObsRandCfg = BlockObsRandCfg()
+    ctrl: BlockCtrlCfg = BlockCtrlCfg()
     task: ForgeBlockInsert = _make_task(2)
 
 
@@ -127,3 +147,4 @@ class ForgePegCfg(ForgeTaskPegInsertCfg):
     """
 
     obs_rand: BlockObsRandCfg = BlockObsRandCfg()
+    ctrl: BlockCtrlCfg = BlockCtrlCfg()

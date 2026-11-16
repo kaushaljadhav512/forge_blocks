@@ -5,10 +5,13 @@
 
 The sim fingertip is driven along the walk's targets through ForgeEnv's own controller (dead zone and
 all), on every physics step, the way deploy/franka_bridge.py drives the robot. Each env is one sim
-setting, every combination of --leak_N (the friction leak, the same on all axes; the walk's own fit is
-added as a setting when the walk has one) and --dead_zone_N (FORGE's actuation dead zone, all three
-axes; it trains on U(0, 5) per axis). Gains are at their defaults and the force noise is off, so the
-settings differ only in friction.
+setting: every force leak crossed with every --dead_zone_N (FORGE's actuation dead zone; one value for
+all three axes or X,Y,Z, e.g. 9,5,5; it trains on U(0, 5) per axis). The leaks are the speed-based
+--leak_N (the same on all axes; the walk's own fit is added when the walk has one) and the pull-based
+--pull_alpha (fake force = -alpha x controller pull; one value or X,Y,Z). Each is also crossed with
+every --friction_N (task-space Coulomb friction at the fingertip: one value for all six, or
+X+,X-,Y+,Y-,Z+,Z-; 0 = off). Gains are at their defaults and the force noise is off, so the settings
+differ only in friction.
 
 Targets map to the sim relative to the hole rim: sim rim + (target - robot rim). The robot rim comes
 from --hole (deploy/runs/hole.json), else the nominal (0.59, 0, 0.028) from deploy/README.md. Before
@@ -36,9 +39,17 @@ parser.add_argument("--walk", help="friction_walk_*.json from the robot")
 parser.add_argument("--seed", type=int, default=0, help="without --walk: the WalkSpec seed")
 parser.add_argument("--seconds", type=float, default=180.0, help="without --walk: walk length")
 parser.add_argument("--task", default="Isaac-ForgeBlocks-Peg8mm-Direct-v0")
-parser.add_argument("--leak_N", type=float, nargs="+", default=[0.0, 1.0, 2.0, 3.0])
+parser.add_argument("--leak_N", type=float, nargs="+", default=[0.0], help="speed-based leak sizes (N)")
 parser.add_argument("--leak_v_mm_s", type=float, default=2.0, help="the leak's speed scale (training used 2)")
-parser.add_argument("--dead_zone_N", type=float, nargs="+", default=[0.0, 2.5, 5.0])
+parser.add_argument("--pull_alpha", nargs="+", default=["0.25", "0.35", "0.45"],
+                    help="pull-based leak shares: A (all axes) or AX,AY,AZ; the walks gave ~0.4/0.25/0.35")
+parser.add_argument("--dead_zone_N", nargs="+", default=["0"],
+                    help="dead-zone values: D (all axes) or DX,DY,DZ")
+parser.add_argument("--friction_N", nargs="+",
+                    default=["0", "2.3,0.95,0.75,1.0,1.05,0.5", "3.45,1.4,1.1,1.5,1.6,0.75",
+                             "4.6,1.9,1.5,2.0,2.1,1.0", "5.75,2.4,1.9,2.5,2.6,1.25"],
+                    help="task-space friction: F (all six) or X+,X-,Y+,Y-,Z+,Z- in N; the session-2 walks "
+                         "lagged as if ~4.6,1.9,1.5,2.0,2.1,1.0")
 parser.add_argument("--hole", help="hole.json from register-hole")
 parser.add_argument("--settle_s", type=float, default=3.0)
 parser.add_argument("--out", help="output prefix (default results/replay_<walk or seed>)")
@@ -74,13 +85,32 @@ def load_walk():
     return None, fb.WalkSpec(seed=args_cli.seed, duration_s=args_cli.seconds)
 
 
+def per_axis(text, n=3):
+    """'v' -> [v] * n; 'a,b,...' -> n values."""
+    v = [float(x) for x in str(text).split(",")]
+    if len(v) == 1:
+        v = v * n
+    if len(v) != n or min(v) < 0:
+        sys.exit(f"expected one value or {n} comma-separated values, all >= 0; got {text!r}")
+    return v
+
+
+def fmt3(v):
+    return f"{v[0]:g}" if len(set(v)) == 1 else "/".join(f"{x:g}" for x in v)
+
+
 def settings(walk):
-    leaks = [(f"leak {v:g} N", [v, v, v]) for v in args_cli.leak_N]
+    """(name, speed leak [3], pull alpha [3], dead zone [3], friction [6]) per env."""
+    zero = [0.0, 0.0, 0.0]
+    leaks = [(f"leak {v:g} N", [v, v, v], zero) for v in args_cli.leak_N]
     if walk and walk.get("fit"):
         ax = walk["fit"]["axes"]
         fitted = [max(0.0, (ax[a]["leak_plus_N"] + ax[a]["leak_minus_N"]) / 2) for a in "xyz"]
-        leaks.append(("leak = walk fit " + "/".join(f"{v:.2f}" for v in fitted), fitted))
-    return [(f"{name}, dead zone {dz:g} N", leak, dz) for name, leak in leaks for dz in args_cli.dead_zone_N]
+        leaks.append(("leak = walk fit " + "/".join(f"{v:.2f}" for v in fitted), fitted, zero))
+    leaks += [(f"pull alpha {fmt3(a)}", zero, a) for a in map(per_axis, args_cli.pull_alpha) if max(a) > 0]
+    frictions = [per_axis(f, 6) for f in args_cli.friction_N]
+    return [(f"{name}, dz {fmt3(dz)}, fric {fmt3(fr)}", leak, alpha, dz, fr)
+            for name, leak, alpha in leaks for dz in map(per_axis, args_cli.dead_zone_N) for fr in frictions]
 
 
 def main():
@@ -93,7 +123,10 @@ def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device or "cuda:0", num_envs=n)
     env_cfg.episode_length_s = args_cli.settle_s + float(traj["t"][-1]) + 2.0  # no reset during the walk
     env_cfg.obs_rand.ft_force = 0.0  # no force noise: settings differ only in friction
-    env_cfg.obs_rand.ft_force_leak_N = [0.0, 1.0]  # allocates the leak buffers; set per env below
+    env_cfg.obs_rand.ft_force_leak_N = [0.0, 1.0]  # allocate the leak buffers; set per env below
+    env_cfg.obs_rand.ft_pull_leak_alpha = [0.0, 1.0]
+    env_cfg.obs_rand.ft_pull_leak_offset_N = [0.0, 0.0]
+    env_cfg.ctrl.task_friction_hi_N = [1.0] * 6  # allocates the friction buffer; set per env below
     env_cfg.obs_rand.ft_force_leak_v_mps = args_cli.leak_v_mm_s / 1000.0
     # FORGE redraws the dead zone every 2 s (forge_env_cfg.py: EventTerm(randomize_dead_zone, mode="interval")),
     # which would overwrite the per-env settings below.
@@ -105,9 +138,11 @@ def main():
 
     # One setting per env, after the reset's randomisation.
     u._leak_N[:] = torch.tensor([c[1] for c in cases], dtype=torch.float32, device=dev)
+    u._pull_alpha[:] = torch.tensor([c[2] for c in cases], dtype=torch.float32, device=dev)
     u._leak_smooth[:] = 0.0
     u.dead_zone_thresholds[:] = 0.0
-    u.dead_zone_thresholds[:, :3] = torch.tensor([[c[2]] * 3 for c in cases], dtype=torch.float32, device=dev)
+    u.dead_zone_thresholds[:, :3] = torch.tensor([c[3] for c in cases], dtype=torch.float32, device=dev)
+    u._task_friction[:] = torch.tensor([c[4] for c in cases], dtype=torch.float32, device=dev)
     u.task_prop_gains = u.default_gains.clone()
     u.task_deriv_gains = factory_utils.get_deriv_gains(u.task_prop_gains)
 
@@ -177,7 +212,9 @@ def main():
               "sim_true_force": R[:, :, 9:12]}
     summary = {"walk": args_cli.walk, "spec": asdict(spec),
                "robot_rim": robot_rim.tolist(), "leak_v_mm_s": args_cli.leak_v_mm_s,
-               "settings": [{"env": e, "name": c[0], "leak_N": c[1], "dead_zone_N": c[2]} for e, c in enumerate(cases)],
+               "settings": [{"env": e, "name": c[0], "leak_N": c[1], "pull_alpha": c[2], "dead_zone_N": c[3],
+                             "friction_N": c[4]}
+                            for e, c in enumerate(cases)],
                "sim_lag_mm": [float(1000 * np.linalg.norm(sim["tip"][:, e] - sim["target"][:, e], axis=1).mean())
                               for e in range(n)]}
 
@@ -192,18 +229,18 @@ def main():
         if "force_no_pose" in robot:
             arrays["robot_force_no_pose"] = robot["force_no_pose"]
         print(f"robot: mean lag behind the target {rows[0]['lag_robot_mm']:.2f} mm")
-        print(f"{'setting':42s} {'lag (mm)':>8s} {'tip vs robot, x/y/z (mm)':>26s} {'force err x/y/z (N)':>22s} "
+        print(f"{'setting':64s} {'lag (mm)':>8s} {'tip vs robot, x/y/z (mm)':>26s} {'force err x/y/z (N)':>22s} "
               f"{'w/o pose err (N)':>20s}")
         for r in rows:
             fmt = lambda v: "/".join(f"{x:.2f}" for x in v)  # noqa: E731
-            print(f"{r['name']:42s} {r['lag_sim_mm']:8.2f} {fmt(r['tip_rms_mm']):>26s} {fmt(r['force_rms_N']):>22s} "
+            print(f"{r['name']:64s} {r['lag_sim_mm']:8.2f} {fmt(r['tip_rms_mm']):>26s} {fmt(r['force_rms_N']):>22s} "
                   f"{fmt(r.get('force_rms_no_pose_N', [float('nan')] * 3)):>20s}")
         worst = max(r["target_mismatch_mm"] for r in rows)
         if worst > 0.5:
             print(f"WARNING: sim and robot targets differ by up to {worst:.1f} mm: wrong walk spec or time base")
     else:
         for e, c in enumerate(cases):
-            print(f"{c[0]:42s} lag {summary['sim_lag_mm'][e]:.2f} mm, |force| mean "
+            print(f"{c[0]:64s} lag {summary['sim_lag_mm'][e]:.2f} mm, |force| mean "
                   f"{np.linalg.norm(sim['force'][:, e], axis=1).mean():.2f} N")
 
     np.savez_compressed(out + ".npz", **arrays)

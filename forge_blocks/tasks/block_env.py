@@ -27,29 +27,91 @@
    -size * tanh(v / ft_force_leak_v_mps) from the true fingertip velocity v, smoothed like the force.
    It is added to the raw estimate, before the scale / bias / dead band above. FORGE's actuation
    dead zone already models the other half of joint friction (the hand moving less than commanded).
+
+6. Pull-based friction leak (off by default), which fits the session-2 walks far better than 5. With
+   ft_pull_leak_alpha = [lo, hi], each episode draws alpha per axis and the observed force gets
+   -alpha * pull, where pull = task stiffness x (controller target - fingertip) is the spring force
+   the controller commands. With ft_pull_leak_offset_N = [lo, hi] it also gets a constant offset per
+   axis and episode. Smoothed and placed like 5, and the two can be combined. The pull only gets
+   large if the hand lags its target, so pair it with a dead zone that matches the robot's friction
+   (env.ctrl.default_dead_zone; the walks needed 5-9 N in x).
+
+7. Task-space Coulomb friction at the fingertip (off by default). FORGE's dead zone removes part of
+   the controller's push, but the frictionless sim arm then coasts instead of sticking, so it doesn't
+   lag like the real Franka (session-2 replays). With ctrl.task_friction_lo_N / _hi_N, each episode
+   draws a friction per axis and direction ([x+, x-, y+, y-, z+, z-]) and every physics step adds,
+   through J^T, the force that holds the fingertip still if it is within those limits, else the
+   limit against the motion (observation.coulomb_friction). Not applied during resets.
 """
 
 import torch
 
 from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
 
-from forge_blocks.observation import force_deadband, friction_leak, noisy_finite_difference, sample_radius_error
+from forge_blocks.observation import (
+    coulomb_friction,
+    force_deadband,
+    friction_leak,
+    noisy_finite_difference,
+    pull_leak,
+    sample_radius_error,
+)
 
 
 class ForgeBlocksEnv(ForgeEnv):
     _prev_noisy_pos = None
     _prev_noisy_quat = None
     _force_bias = None
-    _leak_N = None  # (num_envs, 3) per-episode leak size; None while the leak is off
-    _leak_smooth = None
+    _leak_N = None  # (num_envs, 3) per-episode speed-leak size; None while that leak is off
+    _pull_alpha = None  # (num_envs, 3) per-episode share of the pull that leaks; None while off
+    _leak_offset = None  # (num_envs, 3) per-episode constant offset [N]; None while off
+    _leak_smooth = None  # EMA of the sum of the leaks above; None while all are off
+    _ctrl_target_pos = None  # (num_envs, 3) last controller position target
+    _task_friction = None  # (num_envs, 6) friction [x+, x-, y+, y-, z+, z-] in N; None while off
+    _in_reset = False
+
+    def generate_ctrl_signals(self, ctrl_target_fingertip_midpoint_pos, *args, **kwargs):
+        # ForgeEnv computes the clipped target as a local; keep it for the pull-based leak.
+        self._ctrl_target_pos = ctrl_target_fingertip_midpoint_pos.clone()
+        super().generate_ctrl_signals(ctrl_target_fingertip_midpoint_pos, *args, **kwargs)
+        if self._task_friction is not None and not self._in_reset:
+            self._apply_task_friction()
+
+    def _apply_task_friction(self):
+        """Add the fingertip friction to the torques FactoryEnv.generate_ctrl_signals just set."""
+        J = self.fingertip_midpoint_jacobian[:, 0:3, :]  # (n, 3, 7) translational
+        Jt = J.transpose(1, 2)
+        task_mass = torch.linalg.inv(J @ torch.linalg.inv(self.arm_mass_matrix) @ Jt)
+        force = coulomb_friction(
+            self.applied_wrench[:, 0:3], self.fingertip_midpoint_linvel, task_mass, self.physics_dt,
+            self._task_friction[:, 0::2], self._task_friction[:, 1::2],
+        )
+        n = J.shape[2]
+        self.joint_torque[:, 0:n] = self.joint_torque[:, 0:n] + (Jt @ force.unsqueeze(-1)).squeeze(-1)
+        self._robot.set_joint_effort_target(self.joint_torque)
+
+    def controller_pull(self) -> torch.Tensor:
+        """Spring force the controller commands, stiffness x (target - fingertip), as on the robot
+        (deploy/franka_bridge.py: pull = k * (target - tip)). Zero before the first control step."""
+        if self._ctrl_target_pos is None:
+            return torch.zeros_like(self.fingertip_midpoint_pos)
+        return self.task_prop_gains[:, 0:3] * (self._ctrl_target_pos - self.fingertip_midpoint_pos)
 
     def _compute_intermediate_values(self, dt):
         super()._compute_intermediate_values(dt)
 
-        if self._leak_N is not None:
-            leak = friction_leak(self.fingertip_midpoint_linvel, self._leak_N, self.cfg.obs_rand.ft_force_leak_v_mps)
-            alpha = self.cfg.ft_smoothing_factor  # the same EMA ForgeEnv applies to the sensed force
-            self._leak_smooth = alpha * leak + (1 - alpha) * self._leak_smooth
+        if self._leak_smooth is not None:
+            leak = torch.zeros_like(self.noisy_force)
+            if self._leak_N is not None:
+                leak = leak + friction_leak(
+                    self.fingertip_midpoint_linvel, self._leak_N, self.cfg.obs_rand.ft_force_leak_v_mps
+                )
+            if self._pull_alpha is not None:
+                leak = leak + pull_leak(self.controller_pull(), self._pull_alpha)
+            if self._leak_offset is not None:
+                leak = leak + self._leak_offset
+            ema = self.cfg.ft_smoothing_factor  # the same EMA ForgeEnv applies to the sensed force
+            self._leak_smooth = ema * leak + (1 - ema) * self._leak_smooth
             self.noisy_force = self.noisy_force + self._leak_smooth
 
         scale = getattr(self.cfg.obs_rand, "ft_force_scale", 1.0)
@@ -71,7 +133,12 @@ class ForgeBlocksEnv(ForgeEnv):
         self._remember_noisy_pose()
 
     def randomize_initial_state(self, env_ids):
-        super().randomize_initial_state(env_ids)
+        # Factory's reset drives the hand to its start pose with generate_ctrl_signals; no friction there.
+        self._in_reset = True
+        try:
+            super().randomize_initial_state(env_ids)
+        finally:
+            self._in_reset = False
 
         # Factory zeroes the velocities at the end of its reset; start the history from here so the
         # first step after a reset doesn't difference across the teleport.
@@ -84,15 +151,35 @@ class ForgeBlocksEnv(ForgeEnv):
             direction = torch.randn((len(env_ids), 3), device=self.device)
             self._force_bias[env_ids] = bias_n * direction / torch.linalg.norm(direction, dim=1, keepdim=True)
 
-        leak_lo, leak_hi = getattr(self.cfg.obs_rand, "ft_force_leak_N", [0.0, 0.0])
+        obs_rand = self.cfg.obs_rand
+        leak_lo, leak_hi = getattr(obs_rand, "ft_force_leak_N", [0.0, 0.0])
         if leak_hi > 0.0:
-            if self._leak_N is None:
-                self._leak_N = torch.zeros((self.num_envs, 3), device=self.device)
+            self._leak_N = self._draw_per_axis(self._leak_N, env_ids, leak_lo, leak_hi)
+        alpha_lo, alpha_hi = getattr(obs_rand, "ft_pull_leak_alpha", [0.0, 0.0])
+        if alpha_hi > 0.0:
+            self._pull_alpha = self._draw_per_axis(self._pull_alpha, env_ids, alpha_lo, alpha_hi)
+        off_lo, off_hi = getattr(obs_rand, "ft_pull_leak_offset_N", [0.0, 0.0])
+        if off_lo != 0.0 or off_hi != 0.0:
+            self._leak_offset = self._draw_per_axis(self._leak_offset, env_ids, off_lo, off_hi)
+        if self._leak_N is not None or self._pull_alpha is not None or self._leak_offset is not None:
+            if self._leak_smooth is None:
                 self._leak_smooth = torch.zeros((self.num_envs, 3), device=self.device)
-            self._leak_N[env_ids] = leak_lo + (leak_hi - leak_lo) * torch.rand((len(env_ids), 3), device=self.device)
             # The reset just moved the hand; start the new episode's smoothed leak from 0, as ForgeEnv
             # does for the force.
             self._leak_smooth[env_ids] = 0.0
+        if self._ctrl_target_pos is not None:
+            # The reset's last target belongs to the reset motion; no pull until the next control step.
+            self._ctrl_target_pos[env_ids] = self.fingertip_midpoint_pos[env_ids]
+
+        ctrl = getattr(self.cfg, "ctrl", None)
+        fric_lo = getattr(ctrl, "task_friction_lo_N", [0.0] * 6)
+        fric_hi = getattr(ctrl, "task_friction_hi_N", [0.0] * 6)
+        if max(fric_hi) > 0.0:
+            if self._task_friction is None:
+                self._task_friction = torch.zeros((self.num_envs, 6), device=self.device)
+            lo = torch.tensor(fric_lo, dtype=torch.float32, device=self.device)
+            hi = torch.tensor(fric_hi, dtype=torch.float32, device=self.device)
+            self._task_friction[env_ids] = lo + (hi - lo) * torch.rand((len(env_ids), 6), device=self.device)
 
         mode = getattr(self.cfg.obs_rand, "error_radius_mode", "gaussian")
         if mode == "gaussian":
@@ -104,6 +191,13 @@ class ForgeBlocksEnv(ForgeEnv):
             self.init_fixed_pos_obs_noise[env_ids, 0:2] = error[:, 0:2]
         else:
             self.init_fixed_pos_obs_noise[env_ids] = error
+
+    def _draw_per_axis(self, buf, env_ids, lo, hi):
+        """U(lo, hi) per axis for env_ids, allocating the (num_envs, 3) buffer on first use."""
+        if buf is None:
+            buf = torch.zeros((self.num_envs, 3), device=self.device)
+        buf[env_ids] = lo + (hi - lo) * torch.rand((len(env_ids), 3), device=self.device)
+        return buf
 
     def _remember_noisy_pose(self):
         self._prev_noisy_pos = self.noisy_fingertip_pos.clone()

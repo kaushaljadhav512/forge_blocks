@@ -42,6 +42,15 @@ parser.add_argument("--force_deadband_mode", choices=["axis", "norm"], default="
 parser.add_argument("--friction_leak_N", type=float, nargs="+", default=[0.0],
                     help="fake force against the motion: one value (fixed) or LO HI (per episode and axis)")
 parser.add_argument("--friction_leak_v_mm_s", type=float, default=2.0, help="speed where the leak is ~76%% of full size")
+parser.add_argument("--pull_leak_alpha", type=float, nargs="+", default=[0.0],
+                    help="fake force = -alpha x controller pull: one value (fixed) or LO HI (per episode and axis)")
+parser.add_argument("--pull_leak_offset_N", type=float, nargs="+", default=[0.0],
+                    help="constant force offset with the pull leak: one value or LO HI (per episode and axis, signed)")
+parser.add_argument("--dead_zone_N", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                    help="FORGE's actuation dead-zone maximum per axis (each 2 s it draws U(0, max)); default 5 5 5")
+parser.add_argument("--task_friction_N", type=float, nargs="+", default=[0.0],
+                    help="fingertip Coulomb friction [x+ x- y+ y- z+ z-] in N: 6 values (fixed), or 12 "
+                         "(6 LO then 6 HI, drawn per episode), or one value for all six")
 parser.add_argument("--out", required=True, help="per-episode CSV; a .summary.json is written next to it")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -153,6 +162,23 @@ def main():
         sys.exit("--friction_leak_N takes one value or LO HI, both >= 0")
     env_cfg.obs_rand.ft_force_leak_N = [leak[0], leak[-1]]
     env_cfg.obs_rand.ft_force_leak_v_mps = args_cli.friction_leak_v_mm_s * 1e-3
+    alpha, offset = args_cli.pull_leak_alpha, args_cli.pull_leak_offset_N
+    if len(alpha) not in (1, 2) or min(alpha) < 0 or alpha[0] > alpha[-1]:
+        sys.exit("--pull_leak_alpha takes one value or LO HI, both >= 0")
+    if len(offset) not in (1, 2) or offset[0] > offset[-1]:
+        sys.exit("--pull_leak_offset_N takes one value or LO HI")
+    env_cfg.obs_rand.ft_pull_leak_alpha = [alpha[0], alpha[-1]]
+    env_cfg.obs_rand.ft_pull_leak_offset_N = [offset[0], offset[-1]]
+    if args_cli.dead_zone_N is not None:
+        if min(args_cli.dead_zone_N) < 0:
+            sys.exit("--dead_zone_N must be >= 0")
+        env_cfg.ctrl.default_dead_zone = list(args_cli.dead_zone_N) + list(env_cfg.ctrl.default_dead_zone[3:])
+    fr = args_cli.task_friction_N
+    if len(fr) == 1:
+        fr = fr * 6
+    if len(fr) not in (6, 12) or min(fr) < 0:
+        sys.exit("--task_friction_N takes 1, 6 or 12 values, all >= 0")
+    env_cfg.ctrl.task_friction_lo_N, env_cfg.ctrl.task_friction_hi_N = list(fr[:6]), list(fr[-6:])
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
@@ -237,8 +263,9 @@ def main():
         stress = {
             k: getattr(args_cli, k)
             for k in ("force_scale", "force_bias_N", "action_delay", "gain_scale", "force_deadband_N", "force_deadband_mode",
-                      "friction_leak_N", "friction_leak_v_mm_s")
+                      "friction_leak_N", "friction_leak_v_mm_s", "pull_leak_alpha", "pull_leak_offset_N", "task_friction_N")
         }
+        stress["dead_zone_N"] = list(u.cfg.ctrl.default_dead_zone[:3])
         stress["force_threshold"] = args_cli.force_threshold
         json.dump(
             {
