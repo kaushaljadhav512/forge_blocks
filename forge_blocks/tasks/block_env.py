@@ -42,6 +42,8 @@
    draws a friction per axis and direction ([x+, x-, y+, y-, z+, z-]) and every physics step adds,
    through J^T, the force that holds the fingertip still if it is within those limits, else the
    limit against the motion (observation.coulomb_friction). Not applied during resets.
+   ctrl.task_friction_ramp_steps = [start, end] scales it from 0 to 1 over those env steps (a training
+   curriculum: from scratch with full friction the policy learns to avoid contact and never inserts).
 """
 
 import torch
@@ -77,14 +79,25 @@ class ForgeBlocksEnv(ForgeEnv):
         if self._task_friction is not None and not self._in_reset:
             self._apply_task_friction()
 
+    def task_friction_scale(self) -> float:
+        """Curriculum factor on the friction, 0..1, from ctrl.task_friction_ramp_steps and the env step."""
+        start, end = getattr(self.cfg.ctrl, "task_friction_ramp_steps", [0, 0])
+        if end <= start:
+            return 1.0
+        step = getattr(self, "common_step_counter", 0)
+        return min(max((step - start) / (end - start), 0.0), 1.0)
+
     def _apply_task_friction(self):
         """Add the fingertip friction to the torques FactoryEnv.generate_ctrl_signals just set."""
+        scale = self.task_friction_scale()
+        if scale == 0.0:
+            return
         J = self.fingertip_midpoint_jacobian[:, 0:3, :]  # (n, 3, 7) translational
         Jt = J.transpose(1, 2)
         task_mass = torch.linalg.inv(J @ torch.linalg.inv(self.arm_mass_matrix) @ Jt)
         force = coulomb_friction(
             self.applied_wrench[:, 0:3], self.fingertip_midpoint_linvel, task_mass, self.physics_dt,
-            self._task_friction[:, 0::2], self._task_friction[:, 1::2],
+            scale * self._task_friction[:, 0::2], scale * self._task_friction[:, 1::2],
         )
         n = J.shape[2]
         self.joint_torque[:, 0:n] = self.joint_torque[:, 0:n] + (Jt @ force.unsqueeze(-1)).squeeze(-1)

@@ -68,6 +68,11 @@ class BlockCtrlCfg(ForgeCtrlCfg):
     # to 0 when using it, since that was its stand-in.
     task_friction_lo_N: list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     task_friction_hi_N: list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Training curriculum for that friction: [start, end] in env steps (common_step_counter; one rl_games
+    # epoch is horizon_length = 128 steps). The friction is scaled by 0 before start, rising linearly to
+    # 1 at end. [0, 0] (the default) applies the full friction from the first step. Trained from scratch
+    # with full friction, peg_fric stopped touching the hole by epoch 20 and never succeeded again.
+    task_friction_ramp_steps: list = [0, 0]
 
 
 @configclass

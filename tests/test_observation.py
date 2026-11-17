@@ -352,6 +352,24 @@ class TestForgeBlocksEnv(unittest.TestCase):
         self.assertEqual(len(env.efforts), 1)  # only FactoryEnv's own call, no friction re-send
         torch.testing.assert_close(self._ctrl(env, [2.0, 0.0, 0.0])[0], torch.tensor(-2.0))  # after reset: on
 
+    def test_friction_ramp_scales_the_limits_with_the_env_step(self):
+        f = [4.0] * 6
+        env = self._friction_env(f, f)
+        env.cfg.ctrl.task_friction_ramp_steps = [100, 300]
+        env.randomize_initial_state(torch.tensor([0]))
+        env.fingertip_midpoint_linvel = torch.tensor([[0.02, 0.0, 0.0]])  # sliding in +x: friction at its limit
+        for step, expected in [(0, 0.0), (100, 0.0), (200, -2.0), (300, -4.0), (5000, -4.0)]:
+            env.common_step_counter = step
+            self.assertAlmostEqual(self._ctrl(env, [0.0, 0.0, 0.0])[0].item(), expected, places=5, msg=step)
+
+    def test_friction_ramp_off_by_default_means_full_friction(self):
+        f = [4.0] * 6
+        env = self._friction_env(f, f)
+        env.randomize_initial_state(torch.tensor([0]))
+        env.common_step_counter = 0
+        env.fingertip_midpoint_linvel = torch.tensor([[0.02, 0.0, 0.0]])
+        self.assertAlmostEqual(self._ctrl(env, [0.0, 0.0, 0.0])[0].item(), -4.0, places=5)
+
     def test_friction_draws_per_direction_in_range(self):
         env = self._friction_env([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [2.0, 0.5, 0.0, 0.0, 0.0, 3.0])
         draws = []
