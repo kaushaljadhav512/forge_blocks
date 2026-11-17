@@ -112,3 +112,41 @@ def force_deadband(force: torch.Tensor, deadband: float, mode: str = "axis") -> 
         mag = torch.linalg.norm(force, dim=-1, keepdim=True)
         return force * (mag - deadband).clamp_min(0.0) / mag.clamp_min(1e-9)
     raise ValueError(f"unknown dead-band mode {mode!r}; expected 'axis' or 'norm'")
+
+
+def ramp_factor(step: int, start: int, end: int) -> float:
+    """0 before start, rising linearly to 1 at end; 1 throughout if end <= start (no ramp)."""
+    if end <= start:
+        return 1.0
+    return min(max((step - start) / (end - start), 0.0), 1.0)
+
+
+class CollapseCheck:
+    """Decides once whether a training run has collapsed. Feed it each episode's success rate with the env
+    step at which the episode ended; it averages the rates from episodes ending in [start, end) and, at the
+    first update at or after end, returns a message if that mean is below min_success (else None, as it does
+    before end and ever after deciding). With no episodes in the window it doesn't flag."""
+
+    def __init__(self, start: int, end: int, min_success: float):
+        if not 0 <= start < end:
+            raise ValueError(f"collapse_check needs 0 <= start < end, got [{start}, {end}]")
+        self.start, self.end, self.min_success = start, end, min_success
+        self.rates = []
+        self.decided = False
+
+    def update(self, step: int, rate: float):
+        if self.decided:
+            return None
+        if step < self.end:
+            if step >= self.start:
+                self.rates.append(rate)
+            return None
+        self.decided = True
+        if not self.rates:
+            return None
+        mean = sum(self.rates) / len(self.rates)
+        if mean < self.min_success:
+            return (f"mean success {mean:.3f} over {len(self.rates)} episodes in env steps "
+                    f"[{self.start}, {self.end}) is below {self.min_success}; stopping")
+        print(f"[collapse_check] passed: mean success {mean:.3f} over {len(self.rates)} episodes", flush=True)
+        return None

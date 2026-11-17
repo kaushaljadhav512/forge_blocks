@@ -6,7 +6,9 @@
 
 Error = xy offset between the true slot and the estimate the policy is given, at exactly that
 distance in a random direction (see forge_blocks/tasks/block_env.py). Per episode it logs:
-success, time to first success, mean and peak contact force, and the policy's success prediction.
+success, time to first success, mean and peak contact force, the policy's success prediction, and per physics
+step the peak fingertip speed (what deploy's 0.3 m/s safety limit checks) and peak controller pull
+(stiffness x (target - fingertip), the spring force commanded; it exceeds the contact force by what friction holds).
 
 For the paper's peg evaluation (3D error in its low/medium/high bands), use --paper_bins:
 
@@ -109,6 +111,8 @@ def run_episode(env, wrapped, player, obs):
     peak_smooth = torch.zeros(n, device=u.device)
     sum_smooth = torch.zeros(n, device=u.device)
     first_pred = torch.full((n,), -1, dtype=torch.long, device=u.device)
+    u._eval_peak_speed = torch.zeros(n, device=u.device)  # filled per physics step by track_physics_step
+    u._eval_peak_pull = torch.zeros(n, device=u.device)
     if player.is_rnn:
         player.init_rnn()
     # --action_delay: until the delayed actions arrive, send the reset actions, which hold the pose.
@@ -140,8 +144,27 @@ def run_episode(env, wrapped, player, obs):
                 "peak_force_smooth": peak_smooth,
                 "mean_force_smooth": sum_smooth / max(t - 1, 1),
                 "first_pred_step": first_pred,
+                "peak_speed": u._eval_peak_speed.clone(),
+                "peak_pull": u._eval_peak_pull.clone(),
             }
             return out, obs
+
+
+def track_physics_step(u):
+    """Wrap generate_ctrl_signals (called every physics step) to track peak fingertip speed and controller pull
+    outside resets. Needs the ForgeBlocks env (controller_pull, _in_reset)."""
+    orig = u.generate_ctrl_signals
+
+    def hooked(*args, **kwargs):
+        orig(*args, **kwargs)
+        if getattr(u, "_eval_peak_speed", None) is None or u._in_reset:
+            return
+        speed = torch.linalg.norm(u.fingertip_midpoint_linvel, dim=1)
+        pull = torch.linalg.norm(u.controller_pull(), dim=1)
+        u._eval_peak_speed = torch.maximum(u._eval_peak_speed, speed)
+        u._eval_peak_pull = torch.maximum(u._eval_peak_pull, pull)
+
+    u.generate_ctrl_signals = hooked
 
 
 def main():
@@ -183,6 +206,7 @@ def main():
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
     u.default_gains *= args_cli.gain_scale  # ForgeEnv draws each episode's gains around these
+    track_physics_step(u)
     wrapped, player = make_player(env, agent_cfg)
     step_dt = u.step_dt
 
@@ -225,6 +249,8 @@ def main():
                         "mean_force_smooth_N": float(m["mean_force_smooth"][i]),
                         "predicted_success": int(fp >= 0),
                         "time_to_prediction_s": fp * step_dt if fp >= 0 else "",
+                        "peak_speed_m_s": float(m["peak_speed"][i]),
+                        "peak_pull_N": float(m["peak_pull"][i]),
                     }
                 )
         level = level[: args_cli.episodes]
@@ -248,6 +274,10 @@ def main():
             "mean_force_smooth_N": sum(e["mean_force_smooth_N"] for e in level) / n,
             "mean_peak_force_raw_N": sum(e["peak_force_raw_N"] for e in level) / n,
             "mean_peak_force_smooth_N": sum(e["peak_force_smooth_N"] for e in level) / n,
+            "mean_peak_speed_m_s": sum(e["peak_speed_m_s"] for e in level) / n,
+            "max_peak_speed_m_s": max(e["peak_speed_m_s"] for e in level),
+            "mean_peak_pull_N": sum(e["peak_pull_N"] for e in level) / n,
+            "max_peak_pull_N": max(e["peak_pull_N"] for e in level),
             "pred_precision": len(delays) / len(pred) if pred else None,
             "pred_recall": len(delays) / len(succ) if succ else None,
             "mean_pred_delay_s": sum(delays) / len(delays) if delays else None,

@@ -73,6 +73,11 @@ class BlockCtrlCfg(ForgeCtrlCfg):
     # 1 at end. [0, 0] (the default) applies the full friction from the first step. Trained from scratch
     # with full friction, peg_fric stopped touching the hole by epoch 20 and never succeeded again.
     task_friction_ramp_steps: list = [0, 0]
+    # Ramp the rest of the sim-to-real gap with the same factor s: the force leaks (obs_rand.ft_force_leak_N,
+    # ft_pull_leak_alpha, ft_pull_leak_offset_N) scaled by s, and FORGE's translational dead zone (keep
+    # default_dead_zone at FORGE's [5, 5, 5, ...]) by 1 - s. Before the ramp it trains as plain FORGE, which
+    # (unlike dead zone 0 + leak) hasn't collapsed early; after it, dead zone 0 with full friction and leak.
+    ramp_leak_and_dead_zone: bool = False
 
 
 @configclass
@@ -124,6 +129,9 @@ class ForgeBlockEnvCfg(ForgeEnvCfg):
     episode_length_s = 10.0
     obs_rand: BlockObsRandCfg = BlockObsRandCfg()
     ctrl: BlockCtrlCfg = BlockCtrlCfg()
+    # [start, end, min_success]: stop training if the mean episode success over env steps [start, end) is
+    # below min_success (one epoch = 128 env steps). Off with end <= start. See block_env.py, item 8.
+    collapse_check: list = [0, 0, 0.0]
     task: ForgeBlockInsert = _make_task(2)
 
 
@@ -153,3 +161,6 @@ class ForgePegCfg(ForgeTaskPegInsertCfg):
 
     obs_rand: BlockObsRandCfg = BlockObsRandCfg()
     ctrl: BlockCtrlCfg = BlockCtrlCfg()
+    # [start, end, min_success]: stop training if the mean episode success over env steps [start, end) is
+    # below min_success (one epoch = 128 env steps). Off with end <= start. See block_env.py, item 8.
+    collapse_check: list = [0, 0, 0.0]

@@ -50,11 +50,16 @@ def make_upstream_stub():
             self, ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, ctrl_target_gripper_dof_pos
         ):
             self.ctrl_calls = getattr(self, "ctrl_calls", 0) + 1
+            dz = getattr(self, "dead_zone_thresholds", None)
+            self.seen_dead_zone = None if dz is None else dz.clone()  # what FactoryEnv's controller used
             # FactoryEnv: the controller's wrench and torques, then set_joint_effort_target.
             self.applied_wrench = getattr(self, "stub_wrench", torch.zeros(1, 6))
             self.joint_torque = torch.zeros(1, 9)
             if hasattr(self, "_robot"):
                 self._robot.set_joint_effort_target(self.joint_torque)
+
+        def _log_factory_metrics(self, rew_dict, curr_successes):
+            self.logged = getattr(self, "logged", 0) + 1
 
         def randomize_initial_state(self, env_ids):
             if hasattr(self, "_robot"):  # Factory moves the hand to its start pose with the controller
@@ -303,6 +308,73 @@ class TestForgeBlocksEnv(unittest.TestCase):
         self.assertAlmostEqual(env.noisy_force[0, 0].item(), -2.904, places=3)
 
 
+    def test_ramp_scales_the_leak_when_enabled(self):
+        env = self._pull_env([0.0, 0.0], offset=(-1.0, -1.0))
+        env.cfg.ctrl = types.SimpleNamespace(task_friction_ramp_steps=[100, 300], ramp_leak_and_dead_zone=True)
+        env.randomize_initial_state(torch.tensor([0]))
+        for step, expected in [(0, 0.0), (200, -0.5), (300, -1.0), (5000, -1.0)]:
+            env.common_step_counter = step
+            env._compute_intermediate_values(DT)
+            self.assertAlmostEqual(env.noisy_force[0, 0].item(), expected, places=5, msg=step)
+
+    def test_leak_is_not_ramped_without_the_flag(self):
+        env = self._pull_env([0.0, 0.0], offset=(-1.0, -1.0))
+        env.cfg.ctrl = types.SimpleNamespace(task_friction_ramp_steps=[100, 300])
+        env.randomize_initial_state(torch.tensor([0]))
+        env.common_step_counter = 0
+        env._compute_intermediate_values(DT)
+        self.assertAlmostEqual(env.noisy_force[0, 0].item(), -1.0, places=5)
+
+    def test_ramp_fades_the_translational_dead_zone_for_the_controller_only(self):
+        env = self.env
+        env.cfg.ctrl = types.SimpleNamespace(task_friction_ramp_steps=[100, 300], ramp_leak_and_dead_zone=True)
+        drawn = torch.tensor([[4.0, 2.0, 3.0, 1.0, 0.5, 0.8]])
+        env.dead_zone_thresholds = drawn.clone()
+        for step, scale in [(0, 1.0), (200, 0.5), (300, 0.0)]:
+            env.common_step_counter = step
+            env.generate_ctrl_signals(torch.zeros(1, 3), torch.tensor([DOWN]), 0.0)
+            expected = drawn.clone()
+            expected[:, 0:3] *= scale
+            torch.testing.assert_close(env.seen_dead_zone, expected, msg=str(step))
+            torch.testing.assert_close(env.dead_zone_thresholds, drawn)  # ForgeEnv's draw is left alone
+
+    def test_dead_zone_untouched_without_the_flag(self):
+        env = self.env
+        env.cfg.ctrl = types.SimpleNamespace(task_friction_ramp_steps=[100, 300])
+        env.dead_zone_thresholds = torch.full((1, 6), 3.0)
+        env.common_step_counter = 0
+        env.generate_ctrl_signals(torch.zeros(1, 3), torch.tensor([DOWN]), 0.0)
+        torch.testing.assert_close(env.seen_dead_zone, torch.full((1, 6), 3.0))
+
+    def _episode_end(self, env, step, successes, done=True):
+        env.common_step_counter = step
+        env.reset_buf = torch.tensor([done, done])
+        env._log_factory_metrics({}, torch.tensor(successes))
+
+    def test_collapse_check_stops_a_collapsed_run(self):
+        env = self.env
+        env.cfg.collapse_check = [100, 300, 0.05]
+        self._episode_end(env, 50, [True, True])  # before the window: ignored
+        self._episode_end(env, 150, [False, False])
+        self._episode_end(env, 250, [True, False], done=False)  # not an episode end: ignored
+        self._episode_end(env, 280, [False, False])
+        with self.assertRaisesRegex(RuntimeError, "collapse_check"):
+            self._episode_end(env, 310, [False, False])
+        self.assertEqual(env.logged, 5)  # upstream logging still ran every step
+
+    def test_collapse_check_passes_a_learning_run_and_stays_quiet(self):
+        env = self.env
+        env.cfg.collapse_check = [100, 300, 0.05]
+        self._episode_end(env, 150, [True, False])
+        self._episode_end(env, 310, [False, False])
+        self._episode_end(env, 5000, [False, False])  # decided already: never stops later
+
+    def test_collapse_check_off_by_default(self):
+        env = self.env
+        for step in (0, 10_000, 100_000):
+            self._episode_end(env, step, [False, False])
+        self.assertFalse(env._collapse_check)
+
     def _friction_env(self, lo, hi):
         env = self.env
         env.num_envs = 1
@@ -382,6 +454,30 @@ class TestForgeBlocksEnv(unittest.TestCase):
         self.assertLessEqual(d[:, 1].max().item(), 0.5)
         self.assertEqual(d[:, 2:5].abs().max().item(), 0.0)
         self.assertGreater(d[:, 5].std().item(), 0.5)
+
+
+@unittest.skipIf(torch is None, "needs torch")  # forge_blocks.observation imports it
+class TestRampAndCollapseCheck(unittest.TestCase):
+    def setUp(self):
+        global ramp_factor, CollapseCheck
+        from forge_blocks.observation import CollapseCheck, ramp_factor
+
+    def test_ramp_factor(self):
+        self.assertEqual([ramp_factor(s, 100, 300) for s in (0, 100, 200, 300, 900)], [0.0, 0.0, 0.5, 1.0, 1.0])
+        self.assertEqual(ramp_factor(0, 0, 0), 1.0)
+
+    def test_collapse_check_needs_a_window(self):
+        with self.assertRaises(ValueError):
+            CollapseCheck(300, 100, 0.05)
+
+    def test_collapse_check_without_episodes_in_the_window_does_not_flag(self):
+        c = CollapseCheck(100, 300, 0.05)
+        self.assertIsNone(c.update(400, 0.0))
+
+    def test_collapse_check_threshold_is_strict(self):
+        c = CollapseCheck(0, 10, 0.05)
+        c.update(5, 0.05)
+        self.assertIsNone(c.update(10, 0.0))
 
 
 @unittest.skipIf(torch is None, "needs torch")

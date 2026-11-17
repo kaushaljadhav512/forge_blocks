@@ -44,6 +44,15 @@
    limit against the motion (observation.coulomb_friction). Not applied during resets.
    ctrl.task_friction_ramp_steps = [start, end] scales it from 0 to 1 over those env steps (a training
    curriculum: from scratch with full friction the policy learns to avoid contact and never inserts).
+   With ctrl.ramp_leak_and_dead_zone = True the same factor s also scales the force leaks (5, 6 and the
+   offset) by s and the translational part of FORGE's dead zone (redrawn from default_dead_zone) by 1 - s,
+   so training starts as plain FORGE and ends with the friction model (dead zone 0, as it should be).
+
+8. Collapse check (off by default). From scratch, some seeds settle on hovering above the hole (reward
+   ~77, success 0, no contact) within ~20 epochs and never recover. With collapse_check =
+   [start, end, min_success] (env steps, fraction), the mean episode success rate over episodes ending
+   in [start, end) is checked at the first episode end at or after end; below min_success, training
+   stops with a RuntimeError (the job's log says why; no final checkpoint is written).
 """
 
 import torch
@@ -51,11 +60,13 @@ import torch
 from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
 
 from forge_blocks.observation import (
+    CollapseCheck,
     coulomb_friction,
     force_deadband,
     friction_leak,
     noisy_finite_difference,
     pull_leak,
+    ramp_factor,
     sample_radius_error,
 )
 
@@ -71,21 +82,40 @@ class ForgeBlocksEnv(ForgeEnv):
     _ctrl_target_pos = None  # (num_envs, 3) last controller position target
     _task_friction = None  # (num_envs, 6) friction [x+, x-, y+, y-, z+, z-] in N; None while off
     _in_reset = False
+    _collapse_check = None  # CollapseCheck, built on first use; False while the check is off
 
     def generate_ctrl_signals(self, ctrl_target_fingertip_midpoint_pos, *args, **kwargs):
         # ForgeEnv computes the clipped target as a local; keep it for the pull-based leak.
         self._ctrl_target_pos = ctrl_target_fingertip_midpoint_pos.clone()
-        super().generate_ctrl_signals(ctrl_target_fingertip_midpoint_pos, *args, **kwargs)
+        saved = self.ramped_dead_zone()
+        try:
+            super().generate_ctrl_signals(ctrl_target_fingertip_midpoint_pos, *args, **kwargs)
+        finally:
+            if saved is not None:
+                self.dead_zone_thresholds = saved
         if self._task_friction is not None and not self._in_reset:
             self._apply_task_friction()
 
     def task_friction_scale(self) -> float:
         """Curriculum factor on the friction, 0..1, from ctrl.task_friction_ramp_steps and the env step."""
         start, end = getattr(self.cfg.ctrl, "task_friction_ramp_steps", [0, 0])
-        if end <= start:
-            return 1.0
-        step = getattr(self, "common_step_counter", 0)
-        return min(max((step - start) / (end - start), 0.0), 1.0)
+        return ramp_factor(getattr(self, "common_step_counter", 0), start, end)
+
+    def _ramps_leak_and_dead_zone(self) -> bool:
+        return bool(getattr(getattr(self.cfg, "ctrl", None), "ramp_leak_and_dead_zone", False))
+
+    def ramped_dead_zone(self):
+        """With ramp_leak_and_dead_zone, swap in the dead zone with its translational part scaled by
+        1 - task_friction_scale() for one controller call. Returns the unscaled thresholds to put back
+        afterwards, or None if nothing was swapped. ForgeEnv redraws the thresholds at every reset and
+        every ~2 s, so they are scaled where they are used rather than where they are drawn."""
+        dz = getattr(self, "dead_zone_thresholds", None)
+        if dz is None or not self._ramps_leak_and_dead_zone():
+            return None
+        scaled = dz.clone()
+        scaled[:, 0:3] *= 1.0 - self.task_friction_scale()
+        self.dead_zone_thresholds = scaled
+        return dz
 
     def _apply_task_friction(self):
         """Add the fingertip friction to the torques FactoryEnv.generate_ctrl_signals just set."""
@@ -123,6 +153,8 @@ class ForgeBlocksEnv(ForgeEnv):
                 leak = leak + pull_leak(self.controller_pull(), self._pull_alpha)
             if self._leak_offset is not None:
                 leak = leak + self._leak_offset
+            if self._ramps_leak_and_dead_zone():
+                leak = self.task_friction_scale() * leak
             ema = self.cfg.ft_smoothing_factor  # the same EMA ForgeEnv applies to the sensed force
             self._leak_smooth = ema * leak + (1 - ema) * self._leak_smooth
             self.noisy_force = self.noisy_force + self._leak_smooth
@@ -204,6 +236,18 @@ class ForgeBlocksEnv(ForgeEnv):
             self.init_fixed_pos_obs_noise[env_ids, 0:2] = error[:, 0:2]
         else:
             self.init_fixed_pos_obs_noise[env_ids] = error
+
+    def _log_factory_metrics(self, rew_dict, curr_successes):
+        super()._log_factory_metrics(rew_dict, curr_successes)
+        if self._collapse_check is None:
+            start, end, min_success = getattr(self.cfg, "collapse_check", [0, 0, 0.0])
+            self._collapse_check = CollapseCheck(start, end, min_success) if end > start else False
+        if self._collapse_check and bool(self.reset_buf.any()):
+            rate = float(curr_successes.float().mean())
+            verdict = self._collapse_check.update(self.common_step_counter, rate)
+            if verdict:
+                print(f"[collapse_check] {verdict}", flush=True)
+                raise RuntimeError(f"collapse_check: {verdict}")
 
     def _draw_per_axis(self, buf, env_ids, lo, hi):
         """U(lo, hi) per axis for env_ids, allocating the (num_envs, 3) buffer on first use."""
