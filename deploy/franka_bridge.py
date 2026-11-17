@@ -155,6 +155,10 @@ class RobotState:
         return (self.tool_pos - prev.tool_pos) / dt, w
 
 
+GRASP_MIN_M = 0.0035  # peg grasp widths FrankaPyArm.grasp accepts; libfranka's epsilon_inner matches the minimum
+GRASP_MAX_M = 0.010
+
+
 class FrankaPyArm:
     """The only class that talks to FrankaPy. Calls follow FrankaPy's examples (run_dynamic_pose.py)
     and the Lab2 adapter that runs on this robot; check them against the installed FrankaPy."""
@@ -316,13 +320,15 @@ class FrankaPyArm:
             self._pub = None
 
     def grasp(self, width=0.008, force=40.0) -> float:
-        """Close on the peg. 40 N so the peg doesn't slide under ~11 N of axial contact force."""
+        """Close on the peg. 40 N so the peg doesn't slide under ~11 N of axial contact force. The lab gripper's
+        fingers have divots that centre the peg, so they close past its 8 mm diameter (6.3-6.4 mm measured, down
+        to ~4 mm possible); GRASP_MIN_M only catches a grasp that missed the peg (fingers closed to ~0)."""
         self.fa.goto_gripper(
-            width=width, grasp=True, speed=0.02, force=force, epsilon_inner=0.004, epsilon_outer=0.004, block=True,
-            ignore_errors=False,
+            width=width, grasp=True, speed=0.02, force=force, epsilon_inner=width - GRASP_MIN_M,
+            epsilon_outer=0.004, block=True, ignore_errors=False,
         )
         got = self.wait_gripper_settled()
-        if not 0.006 <= got <= 0.010:
+        if not GRASP_MIN_M <= got <= GRASP_MAX_M:
             raise HardwareError(f"unexpected peg grasp width {got:.4f} m")
         return got
 

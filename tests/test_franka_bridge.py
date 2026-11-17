@@ -610,6 +610,35 @@ class TestCalibration(unittest.TestCase):
             arm.fa.goto_gripper()
             settled(timeout_s=1.0)  # still closing after 1 s
 
+    def _grasp_arm(self, stops_at):
+        """FrankaPyArm whose fingers stop at `stops_at` (m) after closing; records goto_gripper's arguments."""
+
+        class StubFA:
+            def goto_gripper(self, **kw):
+                self.kw = kw
+
+            def get_gripper_width(self):
+                return stops_at
+
+        arm = fb.FrankaPyArm.__new__(fb.FrankaPyArm)
+        arm.fa = StubFA()
+        arm.wait_gripper_settled = lambda **kw: arm.fa.get_gripper_width()
+        return arm
+
+    def test_grasp_accepts_the_divots_down_to_3_5_mm(self):
+        # The lab fingers' divots centre the 8 mm peg and close past it: 6.4 mm measured, ~4 mm possible.
+        for width in (0.0064, 0.004, 0.0035, 0.010):
+            arm = self._grasp_arm(width)
+            self.assertAlmostEqual(arm.grasp(), width)
+            kw = arm.fa.kw
+            self.assertLessEqual(kw["width"] - kw["epsilon_inner"], 0.0035 + 1e-9)  # libfranka must accept it too
+            self.assertAlmostEqual(kw["epsilon_outer"], 0.004)
+
+    def test_grasp_refuses_a_missed_peg(self):
+        for width in (0.0005, 0.003, 0.011):  # closed on nothing, or wider than the peg
+            with self.assertRaises(fb.HardwareError, msg=width):
+                self._grasp_arm(width).grasp()
+
     def test_samplers(self):
         rng = np.random.default_rng(1)
         for _ in range(200):
