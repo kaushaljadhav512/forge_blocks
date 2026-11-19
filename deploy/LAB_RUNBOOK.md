@@ -425,7 +425,7 @@ python3 deploy/run_peg.py check
 2. Grasp the peg:
    ```bash
    python3 deploy/run_peg.py open --ack-safety
-   # hold the peg vertically between the fingers: finger ENDS on the 32 mm line (hardware/README.md)
+   # hold the peg vertically between the fingers at its collar
    python3 deploy/run_peg.py grasp --ack-safety     # 60 N; --force 70 is the maximum
    ```
 - [ ] The printed width is between 0.0035 and 0.010 m (6.3–6.4 mm in sessions 1 and 2; the finger
@@ -451,18 +451,23 @@ With the peg grasped:
 python3 deploy/run_peg.py register-hole --ack-safety
 ```
 
-This repeats 5 times:
 Each prompt says whether the arm is stiff and what Enter does; while it's compliant, a countdown shows
-the seconds left, and it says when the arm is stiff again.
+the seconds left, and it says when the arm is stiff again. This repeats 5 times:
 
 1. Enter starts guide mode for 15 s. Push the peg **fully into the hole** by hand, gently, until it
    bottoms out, then hold it still until guide mode ends. The arm then holds the peg in the hole.
 2. It asks whether you're ready to lift: Enter starts guide mode for 10 s, lift the peg out.
-3. It asks you to confirm the peg is clear and still at the 32 mm line. If the peg slipped in the
-   fingers, Ctrl-C, regrasp (3.3) and start over: a slipped peg shifts every sample.
+3. It asks you to confirm the peg is clear and hasn't moved in the fingers. If it has, Ctrl-C,
+   regrasp (3.3) and start over: a moved peg shifts every sample.
+
+Then once, the depth check: Enter starts guide mode for 10 s. Rest the peg bottom **flat on the boss
+top, about 1 cm from the hole centre**, and hold it still. It prints the bore depth, then gives you
+10 s more to lift the peg off.
 
 - [ ] The printed `spread` is **under 0.5 mm**. If not, check the clamps and run it again.
 - [ ] Write down the `hole rim` it prints.
+- [ ] The printed `bore depth` is 25.0 ± 0.5 mm (no WARNING). The grip height doesn't matter, but the
+      depth does: the policy expects to meet the boss top 25 mm above the seated position, as in sim.
 
 Every later command uses this registration (`deploy/runs/hole.json`).
 

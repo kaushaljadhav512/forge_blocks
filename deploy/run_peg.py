@@ -5,7 +5,7 @@
     run_peg.py home --ack-safety                       FrankaPy's reset_joints (gripper down, above the table)
     run_peg.py guide --seconds 20 --ack-safety         guide mode: move the arm by hand
     run_peg.py rate-test --export EXPORT --ack-safety  holds pose, then 2 mm up step: rates, latency, policy time
-    run_peg.py grasp --ack-safety                      close on the peg (finger ends on the 32 mm line)
+    run_peg.py grasp --ack-safety                      close on the peg at its collar
     run_peg.py press-test --ack-safety                 peg pressed on a free surface -> force_sign
     run_peg.py force-curve --ack-safety                force estimate vs commanded push, 0-15 N
     run_peg.py force-scale --ack-safety                press on a kitchen scale: commanded vs true vs estimate
@@ -231,7 +231,7 @@ def main(argv=None):
         return 0
 
     if args.cmd == "grasp":
-        confirm("Peg between the fingers, finger ends on the 32 mm line?")
+        confirm("Peg between the fingers at its collar, vertical?")
         print(f"grasp width (m): {arm.grasp(force=args.force):.4f}  (force {args.force:.0f} N)")
         return 0
 
@@ -402,10 +402,11 @@ def main(argv=None):
         return 0 if not out["stopped"] else 1
 
     if args.cmd == "register-hole":
-        confirm("Hole base clamped? Peg grasped at the 32 mm line?")
+        confirm("Hole base clamped? Peg grasped (collar against the fingers)?")
         hole = fb.register_hole(arm, n=args.n, confirm=input)
         hole.save(args.dir / "hole.json")
-        log_event(args.dir / "events.jsonl", event="register_hole", seated_tip=hole.seated_tip, spread_m=hole.spread_m)
+        log_event(args.dir / "events.jsonl", event="register_hole", seated_tip=hole.seated_tip, spread_m=hole.spread_m,
+                  surface_tip=hole.surface_tip, depth_m=hole.depth_m)
         if hole.spread_m > 0.0005:
             print("WARNING: spread above 0.5 mm; check clamping and repeat")
         return 0

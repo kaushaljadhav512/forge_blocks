@@ -32,6 +32,8 @@ from policy_runner import ForceFilter, ForgePolicyRunner
 TIP_OFFSET = 0.1121 - 0.1034  # sim fingertip point beyond FrankaPy's tool point, along tool z [m]
 GRASP_TIP_ABOVE_PEG_BOTTOM = 0.0321  # sim grasp: fingertip point (≈ finger ends) above the peg's bottom
 HOLE_DEPTH = 0.025
+DEPTH_TOL_M = 0.0005  # register-hole warns when the measured bore depth is further than this from HOLE_DEPTH
+DEPTH_TOUCH_FROM_AXIS_M = (0.0085, 0.013)  # peg-on-boss touch: clear of the 9 mm bore, still on the boss top
 SEATED_TIP_ABOVE_RIM = GRASP_TIP_ABOVE_PEG_BOTTOM - HOLE_DEPTH  # fingertip z above the rim when seated
 START_ABOVE_RIM = 0.047  # Factory hand_init_pos z
 START_NOISE = (0.02, 0.02, 0.01)  # Factory hand_init_pos_noise (uniform ±)
@@ -387,6 +389,13 @@ class Hole:
 
     seated_tip: list
     samples: list = field(default_factory=list)
+    surface_tip: list | None = None  # fingertip with the peg bottom resting on the boss top beside the hole
+
+    @property
+    def depth_m(self) -> float | None:
+        """Measured bore depth: the peg bottom's drop from the boss top to seated. The grip height cancels out,
+        so this checks the one real dimension the policy relies on (the sim's HOLE_DEPTH)."""
+        return None if self.surface_tip is None else float(self.surface_tip[2] - self.seated_tip[2])
 
     @property
     def rim(self) -> np.ndarray:
@@ -402,12 +411,13 @@ class Hole:
 
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps({**asdict(self), "rim": self.rim.tolist(), "spread_m": self.spread_m}, indent=2))
+        Path(path).write_text(json.dumps({**asdict(self), "rim": self.rim.tolist(), "spread_m": self.spread_m,
+                                          "depth_m": self.depth_m}, indent=2))
 
     @classmethod
     def load(cls, path) -> "Hole":
         d = json.loads(Path(path).read_text())
-        return cls(seated_tip=d["seated_tip"], samples=d.get("samples", []))
+        return cls(seated_tip=d["seated_tip"], samples=d.get("samples", []), surface_tip=d.get("surface_tip"))
 
 
 def guide_countdown(arm, seconds, what, out=print, clock=time.monotonic, sleep=time.sleep):
@@ -431,7 +441,7 @@ def guide_countdown(arm, seconds, what, out=print, clock=time.monotonic, sleep=t
 
 
 def register_hole(arm, n=5, confirm=input, guide_s=15.0, lift_s=10.0, out=print, clock=time.monotonic,
-                  sleep=time.sleep) -> Hole:
+                  sleep=time.sleep, measure_depth=True, touch_s=10.0) -> Hole:
     """Hand-guide the grasped peg into the hole n times; average the seated fingertip pose.
     After each sample the arm holds the peg seated until the operator says they're ready to lift it out
     (the arm is stiff outside guide mode, so it can't be lifted before that), also after the last one.
@@ -448,10 +458,31 @@ def register_hole(arm, n=5, confirm=input, guide_s=15.0, lift_s=10.0, out=print,
         out(f"  sample {i + 1}: seated fingertip {np.round(tip, 4).tolist()}")
         confirm(f"  The arm holds the peg in the hole. Press Enter -> compliant for {lift_s:.0f} s to lift it out.")
         guide_countdown(arm, lift_s, "lift the peg out of the hole", out, clock, sleep)
-        confirm("  Peg out and clear of the hole, still at the 32 mm line (else Ctrl-C, regrasp, start over)? "
+        confirm("  Peg out and clear of the hole, not moved in the fingers (else Ctrl-C, regrasp, start over)? "
                 "Press Enter" + (" for the next sample." if i < n - 1 else " to finish."))
     hole = Hole(seated_tip=np.mean(samples, axis=0).tolist(), samples=samples)
     out(f"hole rim {np.round(hole.rim, 4).tolist()}, spread {hole.spread_m * 1000:.2f} mm (want < 0.5)")
+    if measure_depth:
+        lo, hi = (1000 * r for r in DEPTH_TOUCH_FROM_AXIS_M)
+        out(f"\nDepth check. Arm is STIFF. Put your hands on it, then:")
+        confirm(f"  Press Enter -> compliant for {touch_s:.0f} s. Rest the peg bottom flat on the boss top, "
+                f"about 1 cm ({lo:.0f}-{hi:.0f} mm) from the hole centre, then hold it still.")
+        guide_countdown(arm, touch_s, "peg flat on the boss top beside the hole, hold still", out, clock, sleep)
+        st = arm.read()
+        tip = tool_to_tip(st.tool_pos, st.tool_R)
+        off = float(np.linalg.norm(tip[:2] - np.asarray(hole.seated_tip)[:2]))
+        hole.surface_tip = tip.tolist()
+        out(f"  touch {1000 * off:.1f} mm from the hole axis; bore depth {1000 * hole.depth_m:.1f} mm "
+            f"(sim {1000 * HOLE_DEPTH:.1f})")
+        if not DEPTH_TOUCH_FROM_AXIS_M[0] <= off <= DEPTH_TOUCH_FROM_AXIS_M[1]:
+            out(f"  WARNING: touch should be {lo:.0f}-{hi:.0f} mm from the hole axis (on the boss top, clear of the "
+                "bore); the depth may be wrong. Repeat the registration.")
+        elif abs(hole.depth_m - HOLE_DEPTH) > DEPTH_TOL_M:
+            out(f"  WARNING: depth is {1000 * (hole.depth_m - HOLE_DEPTH):+.1f} mm off the sim's: the policy will meet "
+                "the boss top that much lower (+) or higher (-) than in sim. Check the bore print and that the peg "
+                "is fully home in its collar.")
+        confirm(f"  The arm holds the peg on the boss. Press Enter -> compliant for {lift_s:.0f} s to lift it off.")
+        guide_countdown(arm, lift_s, "lift the peg clear of the hole base", out, clock, sleep)
     return hole
 
 

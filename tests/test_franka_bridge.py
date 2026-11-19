@@ -10,8 +10,10 @@ import json
 import math
 import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -693,6 +695,51 @@ class TestCalibration(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 arm.grasp(force=bad)
 
+    def _depth_registration(self, touch_xy_off, depth):
+        """register_hole with a stub arm: seated at z 0.0288, then the touch `depth` higher, `touch_xy_off` aside."""
+        clock, state = {"t": 0.0}, {"n_guides": 0}
+        seated = np.array([0.552, 0.004, 0.0288])
+        R = np.diag([1.0, -1.0, -1.0])
+
+        class Arm:
+            def guide(self, s, block=True):
+                state["n_guides"] += 1
+                self.until = clock["t"] + s
+
+            def skill_done(self):
+                return clock["t"] >= self.until
+
+            def read(self):
+                # guides: seat, lift (x n), then the touch
+                tip = seated + ([touch_xy_off, 0.0, depth] if state["n_guides"] == 2 * 2 + 1 else 0.0)
+                return types.SimpleNamespace(tool_pos=fb.tip_to_tool(tip, R), tool_R=R)
+
+        def sleep(dt):
+            clock["t"] += dt
+
+        lines = []
+        hole = fb.register_hole(Arm(), n=2, confirm=lambda msg: None, out=lambda *a, **k: lines.append(a[0] if a else ""),
+                                clock=lambda: clock["t"], sleep=sleep)
+        return hole, lines, state["n_guides"]
+
+    def test_register_hole_measures_the_bore_depth(self):
+        hole, lines, guides = self._depth_registration(0.010, 0.0251)
+        self.assertEqual(guides, 2 * 2 + 2)  # 2 samples x (seat, lift), then touch and a last lift
+        self.assertAlmostEqual(hole.depth_m, 0.0251, places=6)
+        self.assertFalse(any("WARNING" in ln for ln in lines))
+        self.assertTrue(any("bore depth 25.1 mm" in ln for ln in lines))
+        with tempfile.TemporaryDirectory() as d:  # survives save/load; old files without the touch still load
+            hole.save(Path(d) / "hole.json")
+            self.assertAlmostEqual(fb.Hole.load(Path(d) / "hole.json").depth_m, 0.0251, places=6)
+            (Path(d) / "old.json").write_text(json.dumps({"seated_tip": [0.5, 0.0, 0.03], "samples": []}))
+            self.assertIsNone(fb.Hole.load(Path(d) / "old.json").depth_m)
+
+    def test_register_hole_warns_on_wrong_depth_or_touch(self):
+        _, lines, _ = self._depth_registration(0.010, 0.0235)  # bore printed 1.5 mm short
+        self.assertTrue(any("WARNING: depth is -1.5 mm" in ln for ln in lines))
+        _, lines, _ = self._depth_registration(0.004, 0.0)  # touched inside the bore
+        self.assertTrue(any("WARNING: touch should be" in ln for ln in lines))
+
     def test_register_hole_asks_before_every_lift(self):
         events, clock = [], {"t": 0.0}
 
@@ -712,7 +759,8 @@ class TestCalibration(unittest.TestCase):
 
         lines = []
         hole = fb.register_hole(Arm(), n=2, confirm=lambda msg: events.append(("ask", msg)),
-                                out=lambda *a, **k: lines.append(a[0] if a else ""), clock=lambda: clock["t"], sleep=sleep)
+                                out=lambda *a, **k: lines.append(a[0] if a else ""), clock=lambda: clock["t"], sleep=sleep,
+                                measure_depth=False)
         kinds = [e[0] for e in events]
         # per sample: ask, seat (15 s), ask "lift", lift (10 s), ask "clear" -- the last sample too
         self.assertEqual(kinds, ["ask", "guide", "ask", "guide", "ask"] * 2)
