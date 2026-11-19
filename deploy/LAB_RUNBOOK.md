@@ -551,7 +551,7 @@ python3 deploy/run_peg.py summary
   `open`, re-grasp on the line, and continue.
 - A series stops on its own after a safety stop. Note what happened, and continue with the same
   command only if the cause is clear and fixed.
-- A tilt over 10 deg **after** the peg is seated ends that attempt as `seated` (printed: "ended after seating
+- A tilt over 10 deg or a force over 25 N **after** the peg is seated ends that attempt as `seated` (printed: "ended after seating
   on tilt ...") and the series goes on: the post-seating sideways push tips the gripper (session 4). Before
   seating it's a safety stop that counts as a failed trial; the series goes on unless it's the third tilt
   stop in a row. Any other safety stop (force, box, speed, frozen state) still ends the series.
