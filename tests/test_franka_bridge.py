@@ -695,56 +695,19 @@ class TestCalibration(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 arm.grasp(force=bad)
 
-    def _depth_registration(self, touch_xy_off, depth):
-        """register_hole with a stub arm: seated at z 0.0288, then the touch `depth` higher, `touch_xy_off` aside."""
-        clock, state = {"t": 0.0}, {"n_guides": 0}
-        seated = np.array([0.552, 0.004, 0.0288])
+    @staticmethod
+    def _register(seated, touch=None, measure_depth=True):
+        """register_hole with a stub arm. seated: the 5 fingertips it reads after each seating guide (4 corners,
+        then the main hole); touch: the fingertip after the depth-check guide."""
+        clock, state, events, lines = {"t": 0.0}, {"guides": 0}, [], []
         R = np.diag([1.0, -1.0, -1.0])
+        tips = {2 * k + 1: np.asarray(t, dtype=float) for k, t in enumerate(seated)}  # guides 1,3,..: seat; 2,4,..: lift
+        if touch is not None:
+            tips[11] = np.asarray(touch, dtype=float)
 
         class Arm:
             def guide(self, s, block=True):
-                state["n_guides"] += 1
-                self.until = clock["t"] + s
-
-            def skill_done(self):
-                return clock["t"] >= self.until
-
-            def read(self):
-                # guides: seat, lift (x n), then the touch
-                tip = seated + ([touch_xy_off, 0.0, depth] if state["n_guides"] == 2 * 2 + 1 else 0.0)
-                return types.SimpleNamespace(tool_pos=fb.tip_to_tool(tip, R), tool_R=R)
-
-        def sleep(dt):
-            clock["t"] += dt
-
-        lines = []
-        hole = fb.register_hole(Arm(), n=2, confirm=lambda msg: None, out=lambda *a, **k: lines.append(a[0] if a else ""),
-                                clock=lambda: clock["t"], sleep=sleep)
-        return hole, lines, state["n_guides"]
-
-    def test_register_hole_measures_the_bore_depth(self):
-        hole, lines, guides = self._depth_registration(0.010, 0.0251)
-        self.assertEqual(guides, 2 * 2 + 2)  # 2 samples x (seat, lift), then touch and a last lift
-        self.assertAlmostEqual(hole.depth_m, 0.0251, places=6)
-        self.assertFalse(any("WARNING" in ln for ln in lines))
-        self.assertTrue(any("bore depth 25.1 mm" in ln for ln in lines))
-        with tempfile.TemporaryDirectory() as d:  # survives save/load; old files without the touch still load
-            hole.save(Path(d) / "hole.json")
-            self.assertAlmostEqual(fb.Hole.load(Path(d) / "hole.json").depth_m, 0.0251, places=6)
-            (Path(d) / "old.json").write_text(json.dumps({"seated_tip": [0.5, 0.0, 0.03], "samples": []}))
-            self.assertIsNone(fb.Hole.load(Path(d) / "old.json").depth_m)
-
-    def test_register_hole_warns_on_wrong_depth_or_touch(self):
-        _, lines, _ = self._depth_registration(0.010, 0.0235)  # bore printed 1.5 mm short
-        self.assertTrue(any("WARNING: depth is -1.5 mm" in ln for ln in lines))
-        _, lines, _ = self._depth_registration(0.004, 0.0)  # touched inside the bore
-        self.assertTrue(any("WARNING: touch should be" in ln for ln in lines))
-
-    def test_register_hole_asks_before_every_lift(self):
-        events, clock = [], {"t": 0.0}
-
-        class Arm:
-            def guide(self, s, block=True):
+                state["guides"] += 1
                 events.append(("guide", s, block))
                 self.until = clock["t"] + s
 
@@ -752,26 +715,71 @@ class TestCalibration(unittest.TestCase):
                 return clock["t"] >= self.until
 
             def read(self):
-                return types.SimpleNamespace(tool_pos=np.array([0.55, 0.0, 0.07]), tool_R=np.diag([1.0, -1.0, -1.0]))
+                return types.SimpleNamespace(tool_pos=fb.tip_to_tool(tips[state["guides"]], R), tool_R=R)
 
         def sleep(dt):
             clock["t"] += dt
 
-        lines = []
-        hole = fb.register_hole(Arm(), n=2, confirm=lambda msg: events.append(("ask", msg)),
-                                out=lambda *a, **k: lines.append(a[0] if a else ""), clock=lambda: clock["t"], sleep=sleep,
-                                measure_depth=False)
-        kinds = [e[0] for e in events]
-        # per sample: ask, seat (15 s), ask "lift", lift (10 s), ask "clear" -- the last sample too
-        self.assertEqual(kinds, ["ask", "guide", "ask", "guide", "ask"] * 2)
-        self.assertEqual([e[1] for e in events if e[0] == "guide"], [15.0, 10.0] * 2)
+        hole = fb.register_hole(Arm(), confirm=lambda msg: events.append(("ask", msg)),
+                                out=lambda *a, **k: lines.append(a[0] if a else ""), clock=lambda: clock["t"],
+                                sleep=sleep, measure_depth=measure_depth)
+        return hole, events, lines
+
+    @staticmethod
+    def _mount(centre, yaw_deg=12.0, corner_z=0.0288, main_z=0.0288, jitter=None, main_off=(0.0, 0.0)):
+        """Seated fingertips for a mount centred at `centre`, rotated by yaw, corners in going-around order."""
+        c, a = np.asarray(centre, dtype=float), math.radians(yaw_deg)
+        h = fb.CORNER_PITCH_M / 2
+        rot = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+        corners = [np.r_[c + rot @ np.array(v) * h, corner_z] for v in ((1, 1), (-1, 1), (-1, -1), (1, -1))]
+        if jitter is not None:
+            corners = [p + np.r_[j, 0.0] for p, j in zip(corners, jitter)]
+        return corners + [np.r_[c + np.asarray(main_off), main_z]]
+
+    def test_register_hole_fits_the_main_hole_from_the_corners(self):
+        centre = np.array([0.552, 0.004])
+        jitter = [(0.00008, -0.00005), (-0.00006, 0.00008), (0.00005, 0.00007), (-0.00008, -0.00004)]  # in the play
+        seated = self._mount(centre, jitter=jitter, main_off=(0.0004, -0.0002), main_z=0.0287)
+        touch = np.r_[centre + [0.010, 0.0], 0.0287 + 0.0251]
+        hole, events, lines = self._register(seated, touch)
+        np.testing.assert_allclose(hole.seated_tip[:2], centre, atol=0.00005)  # corners pin it, not the 9 mm hole
+        self.assertAlmostEqual(hole.seated_tip[2], 0.0287)  # z from the main-hole insertion
+        self.assertLess(hole.square_error_m, 0.0002)
+        self.assertAlmostEqual(hole.centre_offset_m, math.hypot(0.0004, 0.0002), delta=0.00005)
+        self.assertAlmostEqual(hole.depth_m, 0.0251, places=6)
+        self.assertFalse(any("WARNING" in ln for ln in lines), lines)
+        guides = [e[1] for e in events if e[0] == "guide"]
+        self.assertEqual(guides, [15.0, 10.0] * 5 + [10.0, 10.0])  # 4 corners + main, each seat and lift; touch, lift
         self.assertTrue(all(e[2] is False for e in events if e[0] == "guide"))  # non-blocking: we count down
-        self.assertIn("Press Enter", events[0][1])
-        self.assertIn("lift it out", events[2][1])
-        countdown = [ln for ln in lines if "ARM COMPLIANT" in ln]
-        self.assertTrue(any(" 15 s left" in ln for ln in countdown) and any("  1 s left" in ln for ln in countdown))
-        self.assertEqual(sum("ARM STIFF again" in ln for ln in lines), 4)
-        self.assertEqual(len(hole.samples), 2)
+        asks = [e[1] for e in events if e[0] == "ask"]
+        self.assertEqual(sum("corner hole" in a for a in asks), 4)
+        self.assertEqual(sum("main (middle) hole" in a for a in asks), 1)
+        self.assertTrue(any(" 15 s left" in ln for ln in lines if "ARM COMPLIANT" in ln))
+        self.assertEqual(sum("ARM STIFF again" in ln for ln in lines), 12)
+        with tempfile.TemporaryDirectory() as d:  # survives save/load; old files without corners still load
+            hole.save(Path(d) / "hole.json")
+            back = fb.Hole.load(Path(d) / "hole.json")
+            self.assertAlmostEqual(back.square_error_m, hole.square_error_m)
+            self.assertAlmostEqual(back.depth_m, 0.0251, places=6)
+            (Path(d) / "old.json").write_text(json.dumps({"seated_tip": [0.5, 0.0, 0.03], "samples": []}))
+            old = fb.Hole.load(Path(d) / "old.json")
+            self.assertIsNone(old.depth_m)
+            self.assertIsNone(old.square_error_m)
+
+    def test_register_hole_warns_on_a_bad_corner_or_main_hole(self):
+        centre = np.array([0.552, 0.004])
+        _, _, lines = self._register(self._mount(centre, jitter=[(0.001, 0.0), (0, 0), (0, 0), (0, 0)]),
+                                     measure_depth=False)  # a corner 1 mm out: not seated / wrong hole
+        self.assertTrue(any("WARNING: the corners don't form" in ln for ln in lines))
+        _, _, lines = self._register(self._mount(centre, main_off=(0.0008, 0.0)), measure_depth=False)
+        self.assertTrue(any("WARNING: the main hole isn't where" in ln for ln in lines))
+
+    def test_register_hole_warns_on_wrong_depth_or_touch(self):
+        centre = np.array([0.552, 0.004])
+        _, _, lines = self._register(self._mount(centre), np.r_[centre + [0.010, 0.0], 0.0288 + 0.0235])
+        self.assertTrue(any("WARNING: depth is -1.5 mm" in ln for ln in lines))
+        _, _, lines = self._register(self._mount(centre), np.r_[centre + [0.004, 0.0], 0.0288])  # into the bore
+        self.assertTrue(any("WARNING: touch should be" in ln for ln in lines))
 
     def test_samplers(self):
         rng = np.random.default_rng(1)

@@ -419,7 +419,7 @@ python3 deploy/run_peg.py check
 
 ### 3.3 Hole base and peg
 
-1. Clamp the hole base flat on the table so that its bore is about **60 cm in front of the robot base
+1. Clamp the hole mount flat on the table so that its main hole is about **60 cm in front of the robot base
    and centred left-right** (±5 cm is fine). It must not move when pushed. **From here on, don't touch
    the base or the clamps**: if it moves, redo 3.5.
 2. Grasp the peg:
@@ -445,6 +445,10 @@ python3 deploy/run_peg.py press-test --ack-safety              # don't touch the
 
 ### 3.5 Register the hole
 
+The mount has the 9 mm main hole in the middle and four tighter 8.15 mm locating holes at the corners of
+a 60 × 60 mm square around it. The peg has ±0.09 mm of play in a corner hole but ±0.5 mm in the main
+hole, so the corners give the main hole's centre much more precisely than seating in it does.
+
 With the peg grasped:
 
 ```bash
@@ -452,22 +456,23 @@ python3 deploy/run_peg.py register-hole --ack-safety
 ```
 
 Each prompt says whether the arm is stiff and what Enter does; while it's compliant, a countdown shows
-the seconds left, and it says when the arm is stiff again. This repeats 5 times:
+the seconds left, and it says when the arm is stiff again.
 
-1. Enter starts guide mode for 15 s. Push the peg **fully into the hole** by hand, gently, until it
-   bottoms out, then hold it still until guide mode ends. The arm then holds the peg in the hole.
-2. It asks whether you're ready to lift: Enter starts guide mode for 10 s, lift the peg out.
-3. It asks you to confirm the peg is clear and hasn't moved in the fingers. If it has, Ctrl-C,
-   regrasp (3.3) and start over: a moved peg shifts every sample.
+1. **Each corner hole once** (any order, going around), then **the main hole once**. For each:
+   Enter starts guide mode for 15 s. Push the peg **fully in** by hand, gently, until it bottoms out,
+   then hold it still until the countdown ends. The arm then holds the peg in the hole; Enter gives
+   10 s to lift it out; then confirm the peg is clear and hasn't moved in the fingers (if it has,
+   Ctrl-C, regrasp (3.3) and start over).
+2. **Depth check**, once: Enter starts guide mode for 10 s. Rest the peg bottom **flat on the top
+   face, about 1 cm from the main hole's centre**, and hold it still. Then 10 s more to lift it off.
 
-Then once, the depth check: Enter starts guide mode for 10 s. Rest the peg bottom **flat on the boss
-top, about 1 cm from the hole centre**, and hold it still. It prints the bore depth, then gives you
-10 s more to lift the peg off.
+The main hole's position is the corners' centre (xy) and the main-hole insertion's height (z).
 
-- [ ] The printed `spread` is **under 0.5 mm**. If not, check the clamps and run it again.
-- [ ] Write down the `hole rim` it prints.
-- [ ] The printed `bore depth` is 25.0 ± 0.5 mm (no WARNING). The grip height doesn't matter, but the
-      depth does: the policy expects to meet the boss top 25 mm above the seated position, as in sim.
+- [ ] Corner square error **under 0.5 mm** (no WARNING). If not, a corner wasn't seated or the mount moved.
+- [ ] Main-hole insertion **under 0.61 mm** from the corners' centre (no WARNING). If not, check the clamps.
+- [ ] `bore depth` 25.0 ± 0.5 mm (no WARNING). The grip height doesn't matter, but the depth does: the
+      policy expects to meet the top face 25 mm above the seated position, as in sim.
+- [ ] Write down the `main hole rim` it prints.
 
 Every later command uses this registration (`deploy/runs/hole.json`).
 

@@ -171,8 +171,7 @@ def main(argv=None):
     a.add_argument("--box", type=float, nargs=6, metavar=("XLO", "YLO", "ZLO", "XHI", "YHI", "ZHI"),
                    help=f"fingertip bounds, base frame (default {fb.WALK_BOX_LO} {fb.WALK_BOX_HI})")
     a.add_argument("--label", default="", help="e.g. cold, warm: added to the file name")
-    a = add("register-hole", moves=True)
-    a.add_argument("--n", type=int, default=5)
+    add("register-hole", moves=True)
     a = add("shadow", export=True)
     a.add_argument("--seconds", type=float, default=30.0)
     a = add("run", moves=True, export=True)
@@ -402,13 +401,12 @@ def main(argv=None):
         return 0 if not out["stopped"] else 1
 
     if args.cmd == "register-hole":
-        confirm("Hole base clamped? Peg grasped (collar against the fingers)?")
-        hole = fb.register_hole(arm, n=args.n, confirm=input)
+        confirm("Hole mount clamped? Peg grasped (collar against the fingers)?")
+        hole = fb.register_hole(arm, confirm=input)
         hole.save(args.dir / "hole.json")
-        log_event(args.dir / "events.jsonl", event="register_hole", seated_tip=hole.seated_tip, spread_m=hole.spread_m,
-                  surface_tip=hole.surface_tip, depth_m=hole.depth_m)
-        if hole.spread_m > 0.0005:
-            print("WARNING: spread above 0.5 mm; check clamping and repeat")
+        log_event(args.dir / "events.jsonl", event="register_hole", seated_tip=hole.seated_tip, corners=hole.corners,
+                  centre_sample=hole.centre_sample, square_error_m=hole.square_error_m,
+                  centre_offset_m=hole.centre_offset_m, surface_tip=hole.surface_tip, depth_m=hole.depth_m)
         return 0
 
     hole = fb.Hole.load(args.dir / "hole.json")

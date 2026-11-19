@@ -33,7 +33,15 @@ TIP_OFFSET = 0.1121 - 0.1034  # sim fingertip point beyond FrankaPy's tool point
 GRASP_TIP_ABOVE_PEG_BOTTOM = 0.0321  # sim grasp: fingertip point (≈ finger ends) above the peg's bottom
 HOLE_DEPTH = 0.025
 DEPTH_TOL_M = 0.0005  # register-hole warns when the measured bore depth is further than this from HOLE_DEPTH
-DEPTH_TOUCH_FROM_AXIS_M = (0.0085, 0.013)  # peg-on-boss touch: clear of the 9 mm bore, still on the boss top
+DEPTH_TOUCH_FROM_AXIS_M = (0.0085, 0.013)  # peg-on-top touch: clear of the 9 mm bore, well inside the corner holes
+# Hole mount (session 4 on): a cuboid with the 9 mm main hole in the middle and four 8.15 mm locating holes whose
+# centres sit on a 60 x 60 mm square around it. The 7.98 mm peg has +-0.085 mm play in a locating hole and +-0.51 mm
+# in the main one, so the corners pin the main hole's centre (their centroid) far tighter than seating it does.
+CORNER_PITCH_M = 0.060
+PEG_D_M, MAIN_HOLE_D_M, CORNER_HOLE_D_M = 0.00798, 0.0090, 0.00815
+SQUARE_TOL_M = 0.0005  # corner sides/diagonals vs 60 / 84.85 mm: more = a corner wasn't seated or the print is off
+# Main-hole check insertion vs the corners' centre: the peg's play in the main hole plus 0.1 mm for the fit and print.
+CENTRE_TOL_M = (MAIN_HOLE_D_M - PEG_D_M) / 2 + 0.0001
 SEATED_TIP_ABOVE_RIM = GRASP_TIP_ABOVE_PEG_BOTTOM - HOLE_DEPTH  # fingertip z above the rim when seated
 START_ABOVE_RIM = 0.047  # Factory hand_init_pos z
 START_NOISE = (0.02, 0.02, 0.01)  # Factory hand_init_pos_noise (uniform ±)
@@ -389,7 +397,26 @@ class Hole:
 
     seated_tip: list
     samples: list = field(default_factory=list)
-    surface_tip: list | None = None  # fingertip with the peg bottom resting on the boss top beside the hole
+    surface_tip: list | None = None  # fingertip with the peg bottom resting on the top face beside the hole
+    corners: list | None = None  # seated fingertips in the four locating holes (corner registration)
+    centre_sample: list | None = None  # seated fingertip in the main hole, the check insertion
+
+    @property
+    def square_error_m(self) -> float | None:
+        """Worst deviation of the corners' 4 sides and 2 diagonals from the nominal square (order-independent)."""
+        if self.corners is None:
+            return None
+        c = np.asarray(self.corners)[:, :2]
+        d = sorted(float(np.linalg.norm(c[i] - c[j])) for i in range(4) for j in range(i + 1, 4))
+        want = [CORNER_PITCH_M] * 4 + [CORNER_PITCH_M * math.sqrt(2.0)] * 2
+        return float(max(abs(a - b) for a, b in zip(d, want)))
+
+    @property
+    def centre_offset_m(self) -> float | None:
+        """xy distance of the main-hole check insertion from the centre the corners give."""
+        if self.centre_sample is None:
+            return None
+        return float(np.linalg.norm(np.asarray(self.centre_sample)[:2] - np.asarray(self.seated_tip)[:2]))
 
     @property
     def depth_m(self) -> float | None:
@@ -412,12 +439,14 @@ class Hole:
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps({**asdict(self), "rim": self.rim.tolist(), "spread_m": self.spread_m,
-                                          "depth_m": self.depth_m}, indent=2))
+                                          "depth_m": self.depth_m, "square_error_m": self.square_error_m,
+                                          "centre_offset_m": self.centre_offset_m}, indent=2))
 
     @classmethod
     def load(cls, path) -> "Hole":
         d = json.loads(Path(path).read_text())
-        return cls(seated_tip=d["seated_tip"], samples=d.get("samples", []), surface_tip=d.get("surface_tip"))
+        return cls(seated_tip=d["seated_tip"], samples=d.get("samples", []), surface_tip=d.get("surface_tip"),
+                   corners=d.get("corners"), centre_sample=d.get("centre_sample"))
 
 
 def guide_countdown(arm, seconds, what, out=print, clock=time.monotonic, sleep=time.sleep):
@@ -440,49 +469,74 @@ def guide_countdown(arm, seconds, what, out=print, clock=time.monotonic, sleep=t
     out("\a\r  ARM STIFF again (guide mode over)." + " " * 40, flush=True)
 
 
-def register_hole(arm, n=5, confirm=input, guide_s=15.0, lift_s=10.0, out=print, clock=time.monotonic,
+def _guided_seat(arm, title, hole_name, confirm, guide_s, lift_s, out, clock, sleep):
+    """One hand-guided insertion: seat the peg, read the seated fingertip, lift it out again."""
+    out(f"\n{title} Arm is STIFF. Put your hands on it, then:")
+    confirm(f"  Press Enter -> compliant for {guide_s:.0f} s. Seat the peg fully in the {hole_name} (gently, stop "
+            "when it bottoms out), then hold it still until the countdown ends.")
+    guide_countdown(arm, guide_s, f"seat the peg in the {hole_name}, then hold still", out, clock, sleep)
+    st = arm.read()
+    tip = tool_to_tip(st.tool_pos, st.tool_R)
+    out(f"  seated fingertip {np.round(tip, 4).tolist()}")
+    confirm(f"  The arm holds the peg in the hole. Press Enter -> compliant for {lift_s:.0f} s to lift it out.")
+    guide_countdown(arm, lift_s, "lift the peg out of the hole", out, clock, sleep)
+    confirm("  Peg out and clear of the mount, not moved in the fingers (else Ctrl-C, regrasp, start over)? "
+            "Press Enter to go on.")
+    return tip
+
+
+def register_hole(arm, confirm=input, guide_s=15.0, lift_s=10.0, out=print, clock=time.monotonic,
                   sleep=time.sleep, measure_depth=True, touch_s=10.0) -> Hole:
-    """Hand-guide the grasped peg into the hole n times; average the seated fingertip pose.
-    After each sample the arm holds the peg seated until the operator says they're ready to lift it out
-    (the arm is stiff outside guide mode, so it can't be lifted before that), also after the last one.
-    Every prompt says whether the arm is stiff and what Enter does; guide mode shows a countdown."""
-    samples = []
-    for i in range(n):
-        out(f"\n[{i + 1}/{n}] Arm is STIFF. Put your hands on it, then:")
-        confirm(f"  Press Enter -> compliant for {guide_s:.0f} s. Seat the peg fully (gently, stop when it "
-                "bottoms out), then hold it still until the countdown ends.")
-        guide_countdown(arm, guide_s, "seat the peg, then hold still", out, clock, sleep)
-        st = arm.read()
-        tip = tool_to_tip(st.tool_pos, st.tool_R)
-        samples.append(tip.tolist())
-        out(f"  sample {i + 1}: seated fingertip {np.round(tip, 4).tolist()}")
-        confirm(f"  The arm holds the peg in the hole. Press Enter -> compliant for {lift_s:.0f} s to lift it out.")
-        guide_countdown(arm, lift_s, "lift the peg out of the hole", out, clock, sleep)
-        confirm("  Peg out and clear of the hole, not moved in the fingers (else Ctrl-C, regrasp, start over)? "
-                "Press Enter" + (" for the next sample." if i < n - 1 else " to finish."))
-    hole = Hole(seated_tip=np.mean(samples, axis=0).tolist(), samples=samples)
-    out(f"hole rim {np.round(hole.rim, 4).tolist()}, spread {hole.spread_m * 1000:.2f} mm (want < 0.5)")
+    """Register the main hole from the mount's four 8.15 mm locating holes.
+
+    One hand-guided insertion into each corner hole (any order); the main hole's xy is their centroid (for four
+    corners of a square that is also the least-squares fit, whatever its rotation). Then one insertion into the main
+    hole: its seated height is the registration's z, and its xy is checked against the corners' centre. Last, the
+    depth check: the peg bottom on the top face beside the main hole. Between insertions the arm is stiff; every
+    prompt says what Enter does, and guide mode shows a countdown."""
+    corners = []
+    for k in range(4):
+        corners.append(_guided_seat(arm, f"[corner {k + 1}/4] (the corner holes in any order, going around)",
+                                    "corner hole", confirm, guide_s, lift_s, out, clock, sleep).tolist())
+    centre_xy = np.mean(np.asarray(corners)[:, :2], axis=0)
+    main = _guided_seat(arm, "[main hole] The 9 mm hole in the middle, once, as a check.", "main (middle) hole",
+                        confirm, guide_s, lift_s, out, clock, sleep)
+    hole = Hole(seated_tip=[float(centre_xy[0]), float(centre_xy[1]), float(main[2])], samples=corners + [main.tolist()],
+                corners=corners, centre_sample=main.tolist())
+    sq, off = hole.square_error_m, hole.centre_offset_m
+    zs = np.asarray(corners)[:, 2]
+    out(f"\nmain hole rim {np.round(hole.rim, 4).tolist()} (xy from the corners, z from the main hole)")
+    out(f"  corner square: worst side/diagonal error {1000 * sq:.2f} mm (want < {1000 * SQUARE_TOL_M:.1f}); "
+        f"corner seated heights span {1000 * (zs.max() - zs.min()):.2f} mm")
+    out(f"  main-hole insertion {1000 * off:.2f} mm from the corners' centre "
+        f"(want < {1000 * CENTRE_TOL_M:.2f}: the peg's play in the 9 mm hole)")
+    if sq > SQUARE_TOL_M:
+        out("  WARNING: the corners don't form the 60 mm square: a corner wasn't seated, the wrong hole was used, or "
+            "the mount moved. Repeat the registration.")
+    if off > CENTRE_TOL_M:
+        out("  WARNING: the main hole isn't where the corners put it: the mount moved, or the main hole is printed off "
+            "centre. Check the clamps and repeat.")
     if measure_depth:
         lo, hi = (1000 * r for r in DEPTH_TOUCH_FROM_AXIS_M)
-        out(f"\nDepth check. Arm is STIFF. Put your hands on it, then:")
-        confirm(f"  Press Enter -> compliant for {touch_s:.0f} s. Rest the peg bottom flat on the boss top, "
-                f"about 1 cm ({lo:.0f}-{hi:.0f} mm) from the hole centre, then hold it still.")
-        guide_countdown(arm, touch_s, "peg flat on the boss top beside the hole, hold still", out, clock, sleep)
+        out("\nDepth check. Arm is STIFF. Put your hands on it, then:")
+        confirm(f"  Press Enter -> compliant for {touch_s:.0f} s. Rest the peg bottom flat on the top face, "
+                f"about 1 cm ({lo:.0f}-{hi:.0f} mm) from the main hole's centre, then hold it still.")
+        guide_countdown(arm, touch_s, "peg flat on the top face beside the main hole, hold still", out, clock, sleep)
         st = arm.read()
         tip = tool_to_tip(st.tool_pos, st.tool_R)
-        off = float(np.linalg.norm(tip[:2] - np.asarray(hole.seated_tip)[:2]))
+        toff = float(np.linalg.norm(tip[:2] - np.asarray(hole.seated_tip)[:2]))
         hole.surface_tip = tip.tolist()
-        out(f"  touch {1000 * off:.1f} mm from the hole axis; bore depth {1000 * hole.depth_m:.1f} mm "
+        out(f"  touch {1000 * toff:.1f} mm from the main hole's axis; bore depth {1000 * hole.depth_m:.1f} mm "
             f"(sim {1000 * HOLE_DEPTH:.1f})")
-        if not DEPTH_TOUCH_FROM_AXIS_M[0] <= off <= DEPTH_TOUCH_FROM_AXIS_M[1]:
-            out(f"  WARNING: touch should be {lo:.0f}-{hi:.0f} mm from the hole axis (on the boss top, clear of the "
-                "bore); the depth may be wrong. Repeat the registration.")
+        if not DEPTH_TOUCH_FROM_AXIS_M[0] <= toff <= DEPTH_TOUCH_FROM_AXIS_M[1]:
+            out(f"  WARNING: touch should be {lo:.0f}-{hi:.0f} mm from the main hole's axis (on the top face, clear of "
+                "the bore); the depth may be wrong. Repeat the registration.")
         elif abs(hole.depth_m - HOLE_DEPTH) > DEPTH_TOL_M:
             out(f"  WARNING: depth is {1000 * (hole.depth_m - HOLE_DEPTH):+.1f} mm off the sim's: the policy will meet "
-                "the boss top that much lower (+) or higher (-) than in sim. Check the bore print and that the peg "
+                "the top face that much lower (+) or higher (-) than in sim. Check the bore print and that the peg "
                 "is fully home in its collar.")
-        confirm(f"  The arm holds the peg on the boss. Press Enter -> compliant for {lift_s:.0f} s to lift it off.")
-        guide_countdown(arm, lift_s, "lift the peg clear of the hole base", out, clock, sleep)
+        confirm(f"  The arm holds the peg on the mount. Press Enter -> compliant for {lift_s:.0f} s to lift it off.")
+        guide_countdown(arm, lift_s, "lift the peg clear of the mount", out, clock, sleep)
     return hole
 
 
