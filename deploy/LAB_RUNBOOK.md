@@ -426,7 +426,7 @@ python3 deploy/run_peg.py check
    ```bash
    python3 deploy/run_peg.py open --ack-safety
    # hold the peg vertically between the fingers: finger ENDS on the 32 mm line (hardware/README.md)
-   python3 deploy/run_peg.py grasp --ack-safety
+   python3 deploy/run_peg.py grasp --ack-safety     # 60 N; --force 70 is the maximum
    ```
 - [ ] The printed width is between 0.0035 and 0.010 m (6.3–6.4 mm in sessions 1 and 2; the finger
       divots centre the peg and can close to about 4 mm) and the peg sits vertically and doesn't wiggle
@@ -452,9 +452,11 @@ python3 deploy/run_peg.py register-hole --ack-safety
 ```
 
 This repeats 5 times:
-1. Guide mode turns on for 15 s. Push the peg **fully into the hole** by hand until it bottoms out,
-   then hold it still until guide mode ends.
-2. When asked, lift the peg out (guide mode turns on again for 5 s).
+1. Enter starts guide mode for 15 s. Push the peg **fully into the hole** by hand, gently, until it
+   bottoms out, then hold it still until guide mode ends. The arm then holds the peg in the hole.
+2. It asks whether you're ready to lift: Enter starts guide mode for 10 s, lift the peg out.
+3. It asks you to confirm the peg is clear and still at the 32 mm line. If the peg slipped in the
+   fingers, Ctrl-C, regrasp (3.3) and start over: a slipped peg shifts every sample.
 
 - [ ] The printed `spread` is **under 0.5 mm**. If not, check the clamps and run it again.
 - [ ] Write down the `hole rim` it prints.
