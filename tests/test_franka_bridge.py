@@ -10,6 +10,7 @@ import json
 import math
 import os
 import sys
+import types
 import unittest
 
 import numpy as np
@@ -638,6 +639,34 @@ class TestCalibration(unittest.TestCase):
         for width in (0.0005, 0.003, 0.011):  # closed on nothing, or wider than the peg
             with self.assertRaises(fb.HardwareError, msg=width):
                 self._grasp_arm(width).grasp()
+
+    def test_grasp_force_default_and_limit(self):
+        arm = self._grasp_arm(0.0064)
+        arm.grasp()
+        self.assertAlmostEqual(arm.fa.kw["force"], 60.0)  # 40 N let the peg slip in session 3
+        arm.grasp(force=70.0)
+        self.assertAlmostEqual(arm.fa.kw["force"], 70.0)
+        for bad in (0.0, 71.0):
+            with self.assertRaises(ValueError, msg=bad):
+                arm.grasp(force=bad)
+
+    def test_register_hole_asks_before_every_lift(self):
+        events = []
+
+        class Arm:
+            def guide(self, s, block=True):
+                events.append(("guide", s))
+
+            def read(self):
+                return types.SimpleNamespace(tool_pos=np.array([0.55, 0.0, 0.07]), tool_R=np.diag([1.0, -1.0, -1.0]))
+
+        hole = fb.register_hole(Arm(), n=2, confirm=lambda msg: events.append(("ask", msg)))
+        kinds = [e[0] for e in events]
+        # per sample: ask, seat (15 s), ask "ready to lift", lift (10 s), ask "clear" -- the last sample too
+        self.assertEqual(kinds, ["ask", "guide", "ask", "guide", "ask"] * 2)
+        self.assertEqual([e[1] for e in events if e[0] == "guide"], [15.0, 10.0] * 2)
+        self.assertIn("Ready to lift", events[2][1])
+        self.assertEqual(len(hole.samples), 2)
 
     def test_samplers(self):
         rng = np.random.default_rng(1)

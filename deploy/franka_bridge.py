@@ -157,6 +157,8 @@ class RobotState:
 
 GRASP_MIN_M = 0.0035  # peg grasp widths FrankaPyArm.grasp accepts; libfranka's epsilon_inner matches the minimum
 GRASP_MAX_M = 0.010
+GRASP_FORCE_N = 60.0
+GRASP_FORCE_MAX_N = 70.0  # Franka Hand continuous grasp force
 
 
 class FrankaPyArm:
@@ -319,10 +321,13 @@ class FrankaPyArm:
         finally:
             self._pub = None
 
-    def grasp(self, width=0.008, force=40.0) -> float:
-        """Close on the peg. 40 N so the peg doesn't slide under ~11 N of axial contact force. The lab gripper's
+    def grasp(self, width=0.008, force=GRASP_FORCE_N) -> float:
+        """Close on the peg. 40 N let it slip when pushed into the hole by hand (session 3); 60 N by default,
+        at most the Franka Hand's 70 N continuous. The lab gripper's
         fingers have divots that centre the peg, so they close past its 8 mm diameter (6.3-6.4 mm measured, down
         to ~4 mm possible); GRASP_MIN_M only catches a grasp that missed the peg (fingers closed to ~0)."""
+        if not 0.0 < force <= GRASP_FORCE_MAX_N:
+            raise ValueError(f"grasp force {force} N outside (0, {GRASP_FORCE_MAX_N}]")
         self.fa.goto_gripper(
             width=width, grasp=True, speed=0.02, force=force, epsilon_inner=width - GRASP_MIN_M,
             epsilon_outer=0.004, block=True, ignore_errors=False,
@@ -399,19 +404,22 @@ class Hole:
         return cls(seated_tip=d["seated_tip"], samples=d.get("samples", []))
 
 
-def register_hole(arm, n=5, confirm=input, guide_s=15.0) -> Hole:
-    """Hand-guide the grasped peg into the hole n times; average the seated fingertip pose."""
+def register_hole(arm, n=5, confirm=input, guide_s=15.0, lift_s=10.0) -> Hole:
+    """Hand-guide the grasped peg into the hole n times; average the seated fingertip pose.
+    After each sample the arm holds the peg seated until the operator says they're ready to lift it out
+    (the arm is stiff outside guide mode, so it can't be lifted before that), also after the last one."""
     samples = []
     for i in range(n):
-        confirm(f"[{i + 1}/{n}] Guide mode for {guide_s:.0f} s: seat the peg fully, hold it still. Enter to start.")
+        confirm(f"[{i + 1}/{n}] Enter starts guide mode for {guide_s:.0f} s: seat the peg fully (gently, "
+                "stop when it bottoms out), then hold it still until guide mode ends.")
         arm.guide(guide_s, block=True)
         st = arm.read()
         tip = tool_to_tip(st.tool_pos, st.tool_R)
         samples.append(tip.tolist())
         print(f"  seated fingertip {np.round(tip, 4).tolist()}")
-        if i < n - 1:
-            confirm("Lift the peg out (guide mode follows). Enter when clear.")
-            arm.guide(5.0, block=True)
+        confirm(f"  Ready to lift the peg out? Enter starts guide mode for {lift_s:.0f} s.")
+        arm.guide(lift_s, block=True)
+        confirm("  Peg out and clear of the hole, still at the 32 mm line (else Ctrl-C, regrasp, start over)? Enter.")
     hole = Hole(seated_tip=np.mean(samples, axis=0).tolist(), samples=samples)
     print(f"hole rim {np.round(hole.rim, 4).tolist()}, spread {hole.spread_m * 1000:.2f} mm (want < 0.5)")
     return hole

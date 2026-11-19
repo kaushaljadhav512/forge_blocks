@@ -137,7 +137,8 @@ def main(argv=None):
     a.add_argument("--export", help="also time the policy")
     a.add_argument("--force_threshold", type=float, default=7.5)
     a.add_argument("--seconds", type=float, default=5.0)
-    add("grasp", moves=True)
+    a = add("grasp", moves=True)
+    a.add_argument("--force", type=float, default=fb.GRASP_FORCE_N, help=f"N, at most {fb.GRASP_FORCE_MAX_N:.0f}")
     add("open", moves=True)
     add("press-test", moves=True)
     add("force-curve", moves=True)
@@ -230,7 +231,7 @@ def main(argv=None):
 
     if args.cmd == "grasp":
         confirm("Peg between the fingers, finger ends on the 32 mm line?")
-        print("grasp width (m):", arm.grasp())
+        print(f"grasp width (m): {arm.grasp(force=args.force):.4f}  (force {args.force:.0f} N)")
         return 0
 
     if args.cmd == "open":
