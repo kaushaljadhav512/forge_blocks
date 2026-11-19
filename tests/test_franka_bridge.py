@@ -222,7 +222,7 @@ class TestAttempt(unittest.TestCase):
     def test_inserts_with_flipped_biased_force(self):
         arm = FakeArm(raw_sign=-1.0, bias=(1.0, -2.0, 3.0))
         runner = make_runner(force_sign=-1.0)
-        res, steps = attempt(arm, runner)
+        res, steps = attempt(arm, runner, stop_after_seated_s=None)
         self.assertEqual(res["outcome"], "predicted_success", res)
         self.assertTrue(res["success"])
         self.assertIsNotNone(res["time_to_success_s"])
@@ -237,6 +237,15 @@ class TestAttempt(unittest.TestCase):
         # Policy steps at 15 Hz.
         ts = [s["t"] for s in steps]
         self.assertAlmostEqual(float(np.median(np.diff(ts))), runner.cfg.policy_dt, delta=0.006)
+
+    def test_stops_soon_after_seating(self):
+        arm = FakeArm()
+        runner = make_runner()
+        res, steps = attempt(arm, runner, pred_threshold=1.01)  # the prediction can't end it
+        self.assertEqual(res["outcome"], "seated", res)
+        self.assertTrue(res["success"])
+        self.assertTrue(res["seated_at_end"])
+        self.assertLess(steps[-1]["t"] - res["time_to_success_s"], 0.3 + 0.07)
 
     def test_frozen_state_stops_the_attempt(self):
         # Session 3 trial 2: messages kept arriving but joints and force were bit-identical for seconds.

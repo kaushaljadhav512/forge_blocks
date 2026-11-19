@@ -500,8 +500,9 @@ Before each trial it asks for confirmation: check the peg is out of the hole and
 After each trial the arm pulls the peg 6 cm up.
 
 Each trial prints `-> <outcome>, success=<True/False>, ..., peak F=<N>`. The outcome is how the attempt
-ended: `predicted_success` (the policy said it's in), `timeout` or `safety_stop`. `success` is whether
-the peg actually seated, from the registered hole; the two can disagree.
+ended: `seated` (the peg was seated for 0.3 s), `predicted_success` (the policy said it's in first),
+`timeout` or `safety_stop`. `success` is whether the peg was seated at any point, from the registered hole
+(like the sim's success); the prediction and `success` can disagree.
 
 | Trial | Outcome | `success` | Peak force (N) | Notes (stalls, sliding on the rim, ...) |
 |---|---|---|---|---|
@@ -513,7 +514,9 @@ the peg actually seated, from the registered hole; the two can disagree.
 
 > Since session 3's first try (trial 2 tilted to 37° and the robot state froze): the arm now aims the
 > gripper straight down instead of following its own tilt, and an attempt stops on a tilt over 10° or
-> on robot state that hasn't changed for 100 ms. Re-run 3.8 with this before 3.9.
+> on robot state that hasn't changed for 100 ms. It also ends each attempt 0.3 s after the peg is
+> seated: right after seating the policy shoved sideways into the bore wall and tilted the arm.
+> Re-run 3.8 with this before 3.9.
 
 ### 3.9 Evaluation (only if 3.8 had at least 1 success out of 3)
 

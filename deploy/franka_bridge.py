@@ -489,6 +489,10 @@ class BridgeConfig:
     stiffness: tuple = (565.0, 565.0, 565.0, 28.0, 28.0, 28.0)  # sim default_task_prop_gains
     timeout_s: float = 10.0  # sim episode length (150 policy steps)
     pred_threshold: float = 0.5
+    # End the attempt this long after the peg is first seated (outcome "seated"); None: run on. In session 3 the
+    # policy shoved ~13 mm sideways into the bore wall right after seating and tilted the arm to 10-37 deg. The
+    # success prediction came 0.14-0.25 s after seating when it came. Success is latched like the sim's.
+    stop_after_seated_s: float | None = 0.3
     tare_s: float = 0.5
     quat_ref: tuple = (0.0, 1.0, 0.0, 0.0)  # sign convention for observed quats; confirm against the sim
     tip_offset: float = TIP_OFFSET
@@ -589,6 +593,10 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
                 if result["policy_steps"] >= max_steps:
                     result["outcome"] = "timeout"
                     break
+            if (cfg.stop_after_seated_s is not None and result["time_to_success_s"] is not None
+                    and now - t0 - result["time_to_success_s"] >= cfg.stop_after_seated_s):
+                result["outcome"] = "seated"
+                break
             else:
                 target_pos, target_quat = runner.target(tip, quat)
 
@@ -609,7 +617,9 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
     st = arm.read()
     tip = tool_to_tip(st.tool_pos, st.tool_R, cfg.tip_offset)
     result["final_tip"] = tip.tolist()
-    result["success"] = bool(np.linalg.norm(tip[:2] - seated[:2]) < SUCCESS_XY and tip[2] < seated[2] + SUCCESS_Z)
+    # Like the sim (ep_succeeded latches): success = seated at any point. Also record the end pose's check.
+    result["seated_at_end"] = bool(np.linalg.norm(tip[:2] - seated[:2]) < SUCCESS_XY and tip[2] < seated[2] + SUCCESS_Z)
+    result["success"] = result["time_to_success_s"] is not None
     result["mean_force_smooth_N"] = force_sum / max(ticks, 1)
     return result
 
