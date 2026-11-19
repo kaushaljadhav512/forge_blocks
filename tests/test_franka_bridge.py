@@ -224,7 +224,7 @@ class TestAttempt(unittest.TestCase):
     def test_inserts_with_flipped_biased_force(self):
         arm = FakeArm(raw_sign=-1.0, bias=(1.0, -2.0, 3.0))
         runner = make_runner(force_sign=-1.0)
-        res, steps = attempt(arm, runner, stop_after_seated_s=None)
+        res, steps = attempt(arm, runner, stop_after_seated_s=None, pred_threshold=0.5)
         self.assertEqual(res["outcome"], "predicted_success", res)
         self.assertTrue(res["success"])
         self.assertIsNotNone(res["time_to_success_s"])
@@ -243,7 +243,7 @@ class TestAttempt(unittest.TestCase):
     def test_stops_soon_after_seating(self):
         arm = FakeArm()
         runner = make_runner()
-        res, steps = attempt(arm, runner, pred_threshold=1.01)  # the prediction can't end it
+        res, steps = attempt(arm, runner)  # the prediction doesn't end it by default
         self.assertEqual(res["outcome"], "seated", res)
         self.assertTrue(res["success"])
         self.assertTrue(res["seated_at_end"])

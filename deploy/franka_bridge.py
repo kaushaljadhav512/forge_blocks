@@ -612,7 +612,10 @@ class BridgeConfig:
     # see tilt, and in sim the peg stays upright. Translation stays at the sim's 565 N/m.
     attempt_stiffness: tuple = (565.0, 565.0, 565.0, 80.0, 80.0, 80.0)
     timeout_s: float = 10.0  # sim episode length (150 policy steps)
-    pred_threshold: float = 0.5
+    # End the attempt when the policy's success prediction exceeds this; None: never (the sim doesn't either).
+    # On the robot the prediction sits at 0.47-0.52 for the whole approach: in session 4 it crossed 0.5 at
+    # 1.1-1.9 s with the peg still on the top face and ended all three 3.8 attempts.
+    pred_threshold: float | None = None
     # End the attempt this long after the peg is first seated (outcome "seated"); None: run on. In session 3 the
     # policy shoved ~13 mm sideways into the bore wall right after seating and tilted the arm to 10-37 deg. The
     # success prediction came 0.14-0.25 s after seating when it came. Success is latched like the sim's.
@@ -712,7 +715,7 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
                                       "force_smooth": fs.tolist(), "success_prob": p_succ,
                                       "tool_R": R.tolist(), "tilt_deg": tilt_deg(R)})
                 next_policy += rc.policy_dt
-                if p_succ > cfg.pred_threshold:
+                if cfg.pred_threshold is not None and p_succ > cfg.pred_threshold:
                     result["outcome"], result["time_to_prediction_s"] = "predicted_success", now - t0
                     break
                 if result["policy_steps"] >= max_steps:

@@ -103,6 +103,8 @@ def friction_force_sign(calib):
 
 def bridge_cfg(args, calib):
     cfg = fb.BridgeConfig(control_hz=args.control_hz)
+    if getattr(args, "pred_threshold", None) is not None:
+        cfg.pred_threshold = args.pred_threshold
     if "quat_ref" in calib:
         cfg.quat_ref = tuple(calib["quat_ref"])
     return cfg
@@ -181,6 +183,8 @@ def main(argv=None):
     a.add_argument("--trials", type=int, default=1)
     a.add_argument("--seed", type=int, default=0)
     a.add_argument("--auto", action="store_true", help="don't ask before each trial (only after supervised runs)")
+    a.add_argument("--pred_threshold", type=float, help="end an attempt when the success prediction exceeds this "
+                   "(default: never; the attempt ends on seating, a timeout or a safety stop)")
     add("summary")
     args = p.parse_args(argv)
 

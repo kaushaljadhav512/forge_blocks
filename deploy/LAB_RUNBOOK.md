@@ -513,9 +513,12 @@ Before each trial it asks for confirmation: check the peg is out of the hole and
 After each trial the arm pulls the peg 6 cm up.
 
 Each trial prints `-> <outcome>, success=<True/False>, ..., peak F=<N>`. The outcome is how the attempt
-ended: `seated` (the peg was seated for 0.3 s), `predicted_success` (the policy said it's in first),
-`timeout` or `safety_stop`. `success` is whether the peg was seated at any point, from the registered hole
-(like the sim's success); the prediction and `success` can disagree.
+ended: `seated` (the peg was seated for 0.3 s), `timeout` or `safety_stop` (`predicted_success` only with
+`--pred_threshold P`: the policy's success prediction exceeded P first). `success` is whether the peg was
+seated at any point, from the registered hole (like the sim's success).
+
+> Session 4: the prediction sits at 0.47-0.52 for the whole approach on the robot, and the old default stop at
+> 0.5 ended all three attempts at 1.1-1.9 s with the peg on the top face. It's off by default now.
 
 | Trial | Outcome | `success` | Peak force (N) | Notes (stalls, sliding on the rim, ...) |
 |---|---|---|---|---|
