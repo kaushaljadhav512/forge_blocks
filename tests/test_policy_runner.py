@@ -126,6 +126,18 @@ class TestRunner(unittest.TestCase):
         np.testing.assert_array_equal(runner.actions, actions)  # target() doesn't touch the actions
         np.testing.assert_allclose(runner.target(moved, quat)[0], t1)
 
+    def test_hold_vertical_aims_straight_down(self):
+        """ForgeEnv's rule moves at most rot_action_threshold from the current tilt; hold_vertical aims at down."""
+        pos = self.slot + [0.0, 0.0, 0.04]
+        tilted = quat_from_euler_xyz(math.pi + 0.5, 0.0, 0.0)  # ~29 deg off vertical
+        for hold, want in ((False, 0.5 - 0.097), (True, 0.0)):
+            runner = ForgePolicyRunner(make_cfg(ema_factor=1.0, hold_vertical=hold))
+            runner.reset(pos, tilted, self.slot)
+            _, q = runner.target(pos, tilted)
+            roll, pitch, _ = get_euler_xyz(q)
+            self.assertAlmostEqual(abs(roll - math.pi), want, delta=1e-6, msg=hold)
+            self.assertAlmostEqual(math.remainder(pitch, 2 * math.pi), 0.0, delta=1e-6, msg=hold)
+
     def test_ema(self):
         pos, quat = self.slot + [0.0, 0.0, 0.02], hand_down(0.0)
         self.runner.reset(pos, quat, self.slot)

@@ -511,6 +511,10 @@ the peg actually seated, from the registered hole; the two can disagree.
 
 **After any safety stop, stop and report it.**
 
+> Since session 3's first try (trial 2 tilted to 37° and the robot state froze): the arm now aims the
+> gripper straight down instead of following its own tilt, and an attempt stops on a tilt over 10° or
+> on robot state that hasn't changed for 100 ms. Re-run 3.8 with this before 3.9.
+
 ### 3.9 Evaluation (only if 3.8 had at least 1 success out of 3)
 
 Three error bands (how far the hole estimate given to the policy is from the true hole), 20 trials

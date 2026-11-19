@@ -138,6 +138,10 @@ class RunnerConfig:
     # joint reaction at the force_sensor link; the sign relative to libfranka's O_F_ext_hat_K
     # MUST be checked with tests/sim press test and the real press test before trusting it.
     force_sign: float = 1.0
+    # Deploy only: aim roll/pitch at pointing straight down instead of ForgeEnv's current tilt + at most
+    # rot_action_threshold. With the sim's rule the restoring torque is capped (28 Nm/rad x 0.097 rad = 2.7 Nm),
+    # so a side load on the peg tilted the real arm to 37 deg (session 3, trial 2). The policy can't see tilt.
+    hold_vertical: bool = False
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -277,6 +281,8 @@ class ForgePolicyRunner:
         curr_pitch = curr_pitch - 2 * math.pi if curr_pitch > math.pi else curr_pitch
         des_pitch = des_pitch - 2 * math.pi if des_pitch > math.pi else des_pitch
         new_pitch = curr_pitch + np.clip(des_pitch - curr_pitch, -rthr[1], rthr[1])
+        if cfg.hold_vertical:
+            new_roll, new_pitch = des_roll, des_pitch
 
         return target_pos, quat_from_euler_xyz(new_roll, new_pitch, new_yaw)
 

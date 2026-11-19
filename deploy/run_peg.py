@@ -111,7 +111,8 @@ def bridge_cfg(args, calib):
 def make_runner(args, calib, need_sign=True):
     if need_sign and "force_sign" not in calib:
         raise SystemExit("no force_sign yet: run press-test first")
-    return ForgePolicyRunner.from_export(args.export, force_sign=calib.get("force_sign", 1.0), force_threshold=args.force_threshold)
+    return ForgePolicyRunner.from_export(args.export, force_sign=calib.get("force_sign", 1.0), force_threshold=args.force_threshold,
+                                       hold_vertical=True)
 
 
 def main(argv=None):

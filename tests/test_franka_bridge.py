@@ -43,6 +43,7 @@ class FakeArm:
         self.k = np.full(3, 565.0)  # set from start_stream's stiffness
         self.stuck = np.ones(3, dtype=bool)
         self.fric_force = np.zeros(3)
+        self.frozen_after = None  # sim time after which read() content stops changing
         self.pos_gain = None if pos_gain is None else np.array(pos_gain, dtype=float)  # N/m of tip displacement
         self.p0 = None
         self.t = 0.0
@@ -124,7 +125,11 @@ class FakeArm:
             f = f + self.pos_gain @ (self.tip - self.p0)
         if self.spike_at is not None and self.t > self.spike_at:
             f = f + np.array([0.0, 0.0, 100.0])
-        return fb.RobotState(t=self.t, q=np.zeros(7), dq=np.zeros(7), tool_pos=fb.tip_to_tool(self.tip, self.R),
+        # q carries the clock: real joint readings are noisy and never repeat exactly (FreezeCheck relies on it)
+        q = np.full(7, 1e-9 * self.t)
+        if self.frozen_after is not None and self.t > self.frozen_after:
+            q, f = np.zeros(7), self.__dict__.setdefault("_frozen_f", f)
+        return fb.RobotState(t=self.t, q=q, dq=np.zeros(7), tool_pos=fb.tip_to_tool(self.tip, self.R),
                              tool_R=self.R.copy(), force=f).check()
 
     def start_stream(self, pos, R, stiffness, max_duration):
@@ -232,6 +237,23 @@ class TestAttempt(unittest.TestCase):
         # Policy steps at 15 Hz.
         ts = [s["t"] for s in steps]
         self.assertAlmostEqual(float(np.median(np.diff(ts))), runner.cfg.policy_dt, delta=0.006)
+
+    def test_frozen_state_stops_the_attempt(self):
+        # Session 3 trial 2: messages kept arriving but joints and force were bit-identical for seconds.
+        arm = FakeArm()
+        arm.frozen_after = arm.t + 1.0
+        res, _ = attempt(arm, make_runner(), est=RIM + [0.004, 0.0, 0.0])
+        self.assertEqual(res["outcome"], "safety_stop")
+        self.assertIn("unchanged", res["error"])
+
+    def test_tilt_stops_the_attempt(self):
+        mon = fb.SafetyMonitor(fb.SafetyLimits(), RIM, RIM)
+        tip = RIM + [0.0, 0.0, 0.02]
+        c, s = math.cos(math.radians(12.0)), math.sin(math.radians(12.0))
+        tilted = np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]) @ fb.DOWN
+        mon.check(tip, 5.0, 0.01, fb.DOWN)  # upright: fine
+        with self.assertRaises(fb.SafetyStop):
+            mon.check(tip, 5.0, 0.01, tilted)
 
     def test_misaligned_estimate_rests_on_rim_and_times_out(self):
         arm = FakeArm()

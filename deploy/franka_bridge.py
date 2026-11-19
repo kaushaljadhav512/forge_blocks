@@ -435,6 +435,26 @@ class SafetyLimits:
     tip_floor_above_rim_m: float = SEATED_TIP_ABOVE_RIM - 0.003  # below seated = peg slipped or wrong hole
     box_top_above_est_m: float = 0.09
     max_speed_m_s: float = 0.3
+    max_tilt_deg: float = 10.0  # gripper axis from straight down; trial 2 of session 3 ran away to 37 deg
+    # Robot state (joints + force estimate) bit-identical this long = it stopped updating. Session 3 trial 2:
+    # messages kept arriving (so read()'s age check passed) but their content froze for seconds.
+    max_frozen_s: float = 0.1
+
+
+class FreezeCheck:
+    """SafetyStop when the robot state's content stops changing (joint angles and force estimate are noisy,
+    so real updates never repeat exactly)."""
+
+    def __init__(self, max_frozen_s):
+        self.max_frozen_s, self.last, self.since = max_frozen_s, None, None
+
+    def update(self, st, now):
+        key = (tuple(np.asarray(st.q, dtype=float)), tuple(np.asarray(st.force, dtype=float)))
+        if key != self.last:
+            self.last, self.since = key, now
+        elif now - self.since > self.max_frozen_s:
+            raise SafetyStop(f"robot state unchanged for {1000 * (now - self.since):.0f} ms: "
+                             "the controller stopped updating (skill ended on the control PC?)")
 
 
 class SafetyMonitor:
@@ -444,8 +464,12 @@ class SafetyMonitor:
         self.z_min = float(hole_rim[2]) + limits.tip_floor_above_rim_m
         self.z_max = max(float(hole_rim[2]), float(hole_est[2])) + limits.box_top_above_est_m
 
-    def check(self, tip, force_norm, speed):
+    def check(self, tip, force_norm, speed, R=None):
         lim = self.lim
+        if R is not None:
+            tilt = math.degrees(math.acos(float(np.clip(-np.asarray(R)[2, 2], -1.0, 1.0))))
+            if tilt > lim.max_tilt_deg:
+                raise SafetyStop(f"tilt {tilt:.1f} deg > {lim.max_tilt_deg} deg")
         if force_norm > lim.max_force_N:
             raise SafetyStop(f"force {force_norm:.1f} N > {lim.max_force_N} N")
         if min(np.abs(tip[:2] - c).max() for c in self.centres) > lim.box_xy_m:
@@ -531,9 +555,11 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
         ff.reset()
         t0 = clock()
         next_policy, next_tick = t0, t0
+        frozen = FreezeCheck(limits.max_frozen_s)
         while True:
             st = arm.read()
             now = clock()
+            frozen.update(st, now)
             # Filter over the time since the last tick, holding the latest sample (state arrives at 100 Hz,
             # ticks run at up to 200 Hz, so a sample can be read twice; using st.t would over-weight it).
             dt = now - prev_now if prev_now is not None else 1.0 / cfg.control_hz
@@ -541,7 +567,7 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
             tip, quat, R = tip_pose(st, cfg)
             v, w = tip_velocity(st, prev, cfg)
             fnorm = float(np.linalg.norm(fs))
-            safety.check(tip, fnorm, float(np.linalg.norm(v)))
+            safety.check(tip, fnorm, float(np.linalg.norm(v)), R)
             result["peak_force_smooth_N"] = max(result["peak_force_smooth_N"], fnorm)
             force_sum, ticks = force_sum + fnorm, ticks + 1
 
