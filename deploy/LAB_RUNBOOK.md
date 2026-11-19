@@ -452,6 +452,9 @@ python3 deploy/run_peg.py register-hole --ack-safety
 ```
 
 This repeats 5 times:
+Each prompt says whether the arm is stiff and what Enter does; while it's compliant, a countdown shows
+the seconds left, and it says when the arm is stiff again.
+
 1. Enter starts guide mode for 15 s. Push the peg **fully into the hole** by hand, gently, until it
    bottoms out, then hold it still until guide mode ends. The arm then holds the peg in the hole.
 2. It asks whether you're ready to lift: Enter starts guide mode for 10 s, lift the peg out.

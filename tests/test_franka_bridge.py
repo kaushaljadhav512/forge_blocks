@@ -694,21 +694,35 @@ class TestCalibration(unittest.TestCase):
                 arm.grasp(force=bad)
 
     def test_register_hole_asks_before_every_lift(self):
-        events = []
+        events, clock = [], {"t": 0.0}
 
         class Arm:
             def guide(self, s, block=True):
-                events.append(("guide", s))
+                events.append(("guide", s, block))
+                self.until = clock["t"] + s
+
+            def skill_done(self):
+                return clock["t"] >= self.until
 
             def read(self):
                 return types.SimpleNamespace(tool_pos=np.array([0.55, 0.0, 0.07]), tool_R=np.diag([1.0, -1.0, -1.0]))
 
-        hole = fb.register_hole(Arm(), n=2, confirm=lambda msg: events.append(("ask", msg)))
+        def sleep(dt):
+            clock["t"] += dt
+
+        lines = []
+        hole = fb.register_hole(Arm(), n=2, confirm=lambda msg: events.append(("ask", msg)),
+                                out=lambda *a, **k: lines.append(a[0] if a else ""), clock=lambda: clock["t"], sleep=sleep)
         kinds = [e[0] for e in events]
-        # per sample: ask, seat (15 s), ask "ready to lift", lift (10 s), ask "clear" -- the last sample too
+        # per sample: ask, seat (15 s), ask "lift", lift (10 s), ask "clear" -- the last sample too
         self.assertEqual(kinds, ["ask", "guide", "ask", "guide", "ask"] * 2)
         self.assertEqual([e[1] for e in events if e[0] == "guide"], [15.0, 10.0] * 2)
-        self.assertIn("Ready to lift", events[2][1])
+        self.assertTrue(all(e[2] is False for e in events if e[0] == "guide"))  # non-blocking: we count down
+        self.assertIn("Press Enter", events[0][1])
+        self.assertIn("lift it out", events[2][1])
+        countdown = [ln for ln in lines if "ARM COMPLIANT" in ln]
+        self.assertTrue(any(" 15 s left" in ln for ln in countdown) and any("  1 s left" in ln for ln in countdown))
+        self.assertEqual(sum("ARM STIFF again" in ln for ln in lines), 4)
         self.assertEqual(len(hole.samples), 2)
 
     def test_samplers(self):

@@ -365,6 +365,12 @@ class FrankaPyArm:
         """Hand-guiding (zero-stiffness) mode."""
         self.fa.run_guide_mode(duration=float(duration), block=block)
 
+    def skill_done(self) -> bool:
+        return bool(self.fa.is_skill_done())
+
+    def wait_skill(self):
+        self.fa.wait_for_skill()
+
     def stop(self):
         try:
             self.fa.stop_skill()
@@ -404,24 +410,48 @@ class Hole:
         return cls(seated_tip=d["seated_tip"], samples=d.get("samples", []))
 
 
-def register_hole(arm, n=5, confirm=input, guide_s=15.0, lift_s=10.0) -> Hole:
+def guide_countdown(arm, seconds, what, out=print, clock=time.monotonic, sleep=time.sleep):
+    """Guide mode for `seconds` with a live countdown on one line, then wait until the arm is stiff again.
+    Uses the arm's own skill status when it has one (the guide skill starts a moment after the request)."""
+    arm.guide(seconds, block=False)
+    t0, shown = clock(), None
+    done = getattr(arm, "skill_done", None)
+    while True:
+        left = seconds - (clock() - t0)
+        if (done() if done is not None else left <= 0.0) or left < -5.0:
+            break
+        s = max(0, math.ceil(left))
+        if s != shown:
+            out(f"\r  ARM COMPLIANT: {s:2d} s left -- {what}   ", end="", flush=True)
+            shown = s
+        sleep(0.1)
+    if hasattr(arm, "wait_skill"):
+        arm.wait_skill()
+    out("\a\r  ARM STIFF again (guide mode over)." + " " * 40, flush=True)
+
+
+def register_hole(arm, n=5, confirm=input, guide_s=15.0, lift_s=10.0, out=print, clock=time.monotonic,
+                  sleep=time.sleep) -> Hole:
     """Hand-guide the grasped peg into the hole n times; average the seated fingertip pose.
     After each sample the arm holds the peg seated until the operator says they're ready to lift it out
-    (the arm is stiff outside guide mode, so it can't be lifted before that), also after the last one."""
+    (the arm is stiff outside guide mode, so it can't be lifted before that), also after the last one.
+    Every prompt says whether the arm is stiff and what Enter does; guide mode shows a countdown."""
     samples = []
     for i in range(n):
-        confirm(f"[{i + 1}/{n}] Enter starts guide mode for {guide_s:.0f} s: seat the peg fully (gently, "
-                "stop when it bottoms out), then hold it still until guide mode ends.")
-        arm.guide(guide_s, block=True)
+        out(f"\n[{i + 1}/{n}] Arm is STIFF. Put your hands on it, then:")
+        confirm(f"  Press Enter -> compliant for {guide_s:.0f} s. Seat the peg fully (gently, stop when it "
+                "bottoms out), then hold it still until the countdown ends.")
+        guide_countdown(arm, guide_s, "seat the peg, then hold still", out, clock, sleep)
         st = arm.read()
         tip = tool_to_tip(st.tool_pos, st.tool_R)
         samples.append(tip.tolist())
-        print(f"  seated fingertip {np.round(tip, 4).tolist()}")
-        confirm(f"  Ready to lift the peg out? Enter starts guide mode for {lift_s:.0f} s.")
-        arm.guide(lift_s, block=True)
-        confirm("  Peg out and clear of the hole, still at the 32 mm line (else Ctrl-C, regrasp, start over)? Enter.")
+        out(f"  sample {i + 1}: seated fingertip {np.round(tip, 4).tolist()}")
+        confirm(f"  The arm holds the peg in the hole. Press Enter -> compliant for {lift_s:.0f} s to lift it out.")
+        guide_countdown(arm, lift_s, "lift the peg out of the hole", out, clock, sleep)
+        confirm("  Peg out and clear of the hole, still at the 32 mm line (else Ctrl-C, regrasp, start over)? "
+                "Press Enter" + (" for the next sample." if i < n - 1 else " to finish."))
     hole = Hole(seated_tip=np.mean(samples, axis=0).tolist(), samples=samples)
-    print(f"hole rim {np.round(hole.rim, 4).tolist()}, spread {hole.spread_m * 1000:.2f} mm (want < 0.5)")
+    out(f"hole rim {np.round(hole.rim, 4).tolist()}, spread {hole.spread_m * 1000:.2f} mm (want < 0.5)")
     return hole
 
 
