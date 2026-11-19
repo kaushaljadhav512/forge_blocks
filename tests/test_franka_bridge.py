@@ -247,6 +247,18 @@ class TestAttempt(unittest.TestCase):
         self.assertTrue(res["seated_at_end"])
         self.assertLess(steps[-1]["t"] - res["time_to_success_s"], 0.3 + 0.07)
 
+    def test_attempt_streams_stiffer_rotation_and_logs_orientation(self):
+        arm = FakeArm()
+        seen = []
+        start = arm.start_stream
+        arm.start_stream = lambda pos, R, stiffness, max_duration: (seen.append(stiffness),
+                                                                     start(pos, R, stiffness, max_duration))[1]
+        res, steps = attempt(arm, make_runner())
+        self.assertEqual(list(seen[0]), [565.0, 565.0, 565.0, 80.0, 80.0, 80.0])
+        self.assertEqual(list(fb.BridgeConfig().stiffness)[3:], [28.0, 28.0, 28.0])  # calibration commands unchanged
+        np.testing.assert_allclose(steps[0]["tool_R"], arm.R, atol=1e-12)
+        self.assertAlmostEqual(steps[0]["tilt_deg"], 0.0, places=6)
+
     def test_frozen_state_stops_the_attempt(self):
         # Session 3 trial 2: messages kept arriving but joints and force were bit-identical for seconds.
         arm = FakeArm()

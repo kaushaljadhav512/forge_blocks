@@ -441,6 +441,11 @@ class SafetyLimits:
     max_frozen_s: float = 0.1
 
 
+def tilt_deg(R) -> float:
+    """Angle between the gripper axis and straight down."""
+    return math.degrees(math.acos(float(np.clip(-np.asarray(R)[2, 2], -1.0, 1.0))))
+
+
 class FreezeCheck:
     """SafetyStop when the robot state's content stops changing (joint angles and force estimate are noisy,
     so real updates never repeat exactly)."""
@@ -467,7 +472,7 @@ class SafetyMonitor:
     def check(self, tip, force_norm, speed, R=None):
         lim = self.lim
         if R is not None:
-            tilt = math.degrees(math.acos(float(np.clip(-np.asarray(R)[2, 2], -1.0, 1.0))))
+            tilt = tilt_deg(R)
             if tilt > lim.max_tilt_deg:
                 raise SafetyStop(f"tilt {tilt:.1f} deg > {lim.max_tilt_deg} deg")
         if force_norm > lim.max_force_N:
@@ -487,6 +492,10 @@ class SafetyMonitor:
 class BridgeConfig:
     control_hz: float = 200.0  # target updates; measure what FrankaPy sustains with `run_peg.py rate-test`
     stiffness: tuple = (565.0, 565.0, 565.0, 28.0, 28.0, 28.0)  # sim default_task_prop_gains
+    # Policy attempts only: rotation 80 Nm/rad instead of the sim's 28. At 28 the real wrist started every
+    # session-3 attempt 2-3 deg off vertical and side loads on the peg tipped it 10-37 deg; the policy can't
+    # see tilt, and in sim the peg stays upright. Translation stays at the sim's 565 N/m.
+    attempt_stiffness: tuple = (565.0, 565.0, 565.0, 80.0, 80.0, 80.0)
     timeout_s: float = 10.0  # sim episode length (150 policy steps)
     pred_threshold: float = 0.5
     # End the attempt this long after the peg is first seated (outcome "seated"); None: run on. In session 3 the
@@ -548,7 +557,7 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
     prev, prev_now, force_sum, ticks = None, None, 0.0, 0
     st = arm.read()
     hold_tool, hold_R = st.tool_pos.copy(), st.tool_R.copy()
-    arm.start_stream(hold_tool, hold_R, cfg.stiffness, max_duration=cfg.timeout_s + STREAM_SETTLE_S + cfg.tare_s + 5.0)
+    arm.start_stream(hold_tool, hold_R, cfg.attempt_stiffness, max_duration=cfg.timeout_s + STREAM_SETTLE_S + cfg.tare_s + 5.0)
     try:
         tare = stream_tare(arm, hold_tool, hold_R, cfg, clock, sleep)
         result["tare_N"] = tare.tolist()
@@ -585,7 +594,8 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
                 if log_steps is not None:
                     log_steps.append({"t": now - t0, "obs": obs.tolist(), "actions": runner.actions.tolist(),
                                       "target": target_pos.tolist(), "tip": tip.tolist(), "force_raw": st.force.tolist(),
-                                      "force_smooth": fs.tolist(), "success_prob": p_succ})
+                                      "force_smooth": fs.tolist(), "success_prob": p_succ,
+                                      "tool_R": R.tolist(), "tilt_deg": tilt_deg(R)})
                 next_policy += rc.policy_dt
                 if p_succ > cfg.pred_threshold:
                     result["outcome"], result["time_to_prediction_s"] = "predicted_success", now - t0

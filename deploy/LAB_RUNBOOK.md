@@ -516,7 +516,8 @@ ended: `seated` (the peg was seated for 0.3 s), `predicted_success` (the policy 
 > gripper straight down instead of following its own tilt, and an attempt stops on a tilt over 10° or
 > on robot state that hasn't changed for 100 ms. It also ends each attempt 0.3 s after the peg is
 > seated: right after seating the policy shoved sideways into the bore wall and tilted the arm.
-> Re-run 3.8 with this before 3.9.
+> During attempts the wrist is stiffer than in sim (80 instead of 28 Nm/rad), so it starts upright and
+> side loads tip it less. Re-run 3.8 with this before 3.9.
 
 ### 3.9 Evaluation (only if 3.8 had at least 1 success out of 3)
 
