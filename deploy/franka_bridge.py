@@ -745,7 +745,7 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
             # stop_after_seated_s window). The attempt still ends here, but as seated, not as a safety stop.
             result["outcome"], result["post_seat_stop"] = "seated", str(exc)
         else:
-            result["outcome"], result["error"] = "safety_stop", str(exc)
+            result["outcome"], result["error"], result["stop_kind"] = "safety_stop", str(exc), exc.kind
     finally:
         arm.stop_stream()
 

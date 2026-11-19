@@ -447,8 +447,12 @@ def shadow(arm, runner, hole, cfg, seconds):
     return 0
 
 
+MAX_TILT_STREAK = 3  # tilt stops in a row that end a series
+
+
 def run_trials(arm, runner, hole, cfg, args):
     rng = np.random.default_rng(args.seed)
+    tilt_streak = 0
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     label = "air" if args.air else f"{args.band[0]:g}-{args.band[1]:g}"
     results_path = args.dir / "results.jsonl"
@@ -487,8 +491,17 @@ def run_trials(arm, runner, hole, cfg, args):
         st = arm.read()
         arm.goto(st.tool_pos + np.array([0.0, 0.0, 0.06]), st.tool_R, 3.0)  # pull the peg out
         if res["outcome"] == "safety_stop" and not args.air:
+            # A tilt before seating (the peg caught on the hole's edge while the policy pulls sideways) is a
+            # failed attempt: the attempt already ended and the peg is pulled out. Session 4 band 0-1 trial 9.
+            # Several in a row point at something else (grasp, mount): stop then.
+            if res.get("stop_kind") == "tilt" and tilt_streak + 1 < MAX_TILT_STREAK:
+                tilt_streak += 1
+                print(f"  tilt stop counted as a failure; continuing ({tilt_streak} in a row, the series stops at "
+                      f"{MAX_TILT_STREAK})")
+                continue
             print("Stopping the series after a safety stop. Inspect before continuing.")
             return 1
+        tilt_streak = 0
     return 0
 
 

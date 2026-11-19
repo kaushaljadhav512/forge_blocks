@@ -553,7 +553,8 @@ python3 deploy/run_peg.py summary
   command only if the cause is clear and fixed.
 - A tilt over 10 deg **after** the peg is seated ends that attempt as `seated` (printed: "ended after seating
   on tilt ...") and the series goes on: the post-seating sideways push tips the gripper (session 4). Before
-  seating it's still a safety stop.
+  seating it's a safety stop that counts as a failed trial; the series goes on unless it's the third tilt
+  stop in a row. Any other safety stop (force, box, speed, frozen state) still ends the series.
 - To continue a stopped series, re-run with `--seed N` (a new seed: the same seed repeats the same trials).
 
 | Band (mm) | Success (sim, with the session-2 friction) | Success (robot) | Mean peak force (sim / robot) | Safety stops |

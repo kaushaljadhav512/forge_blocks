@@ -308,6 +308,7 @@ class TestAttempt(unittest.TestCase):
         self.assertEqual(res["outcome"], "safety_stop", res)
         self.assertFalse(res["success"])
         self.assertIn("tilt", res["error"])
+        self.assertEqual(res["stop_kind"], "tilt")
 
     def test_misaligned_estimate_rests_on_rim_and_times_out(self):
         arm = FakeArm()
