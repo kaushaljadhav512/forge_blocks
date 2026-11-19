@@ -124,7 +124,9 @@ class HardwareError(RuntimeError):
 
 
 class SafetyStop(RuntimeError):
-    pass
+    def __init__(self, msg, kind=None):
+        super().__init__(msg)
+        self.kind = kind  # "tilt" for the tilt limit; run_attempt treats it as benign once the peg is seated
 
 
 @dataclass
@@ -589,7 +591,7 @@ class SafetyMonitor:
         if R is not None:
             tilt = tilt_deg(R)
             if tilt > lim.max_tilt_deg:
-                raise SafetyStop(f"tilt {tilt:.1f} deg > {lim.max_tilt_deg} deg")
+                raise SafetyStop(f"tilt {tilt:.1f} deg > {lim.max_tilt_deg} deg", kind="tilt")
         if force_norm > lim.max_force_N:
             raise SafetyStop(f"force {force_norm:.1f} N > {lim.max_force_N} N")
         if min(np.abs(tip[:2] - c).max() for c in self.centres) > lim.box_xy_m:
@@ -738,7 +740,12 @@ def run_attempt(arm, runner: ForgePolicyRunner, hole: Hole, hole_est, cfg: Bridg
             else:
                 next_tick = clock()  # fell behind; don't try to catch up with a burst
     except SafetyStop as exc:
-        result["outcome"], result["error"] = "safety_stop", str(exc)
+        if exc.kind == "tilt" and result["time_to_success_s"] is not None:
+            # After seating, the policy's sideways push tips the gripper (session 4: 4-10 deg within the
+            # stop_after_seated_s window). The attempt still ends here, but as seated, not as a safety stop.
+            result["outcome"], result["post_seat_stop"] = "seated", str(exc)
+        else:
+            result["outcome"], result["error"] = "safety_stop", str(exc)
     finally:
         arm.stop_stream()
 

@@ -482,7 +482,8 @@ def run_trials(arm, runner, hole, cfg, args):
         res.update(trial=k + 1, band=label, error_m=err.tolist(), export=args.export, seed=args.seed, attempt=name)
         log_event(results_path, **res)
         print(f"  -> {res['outcome']}, success={res['success']}, t_success={res['time_to_success_s']}, "
-              f"peak F={res['peak_force_smooth_N']:.1f} N" + (f", {res['error']}" if res["error"] else ""))
+              f"peak F={res['peak_force_smooth_N']:.1f} N" + (f", {res['error']}" if res["error"] else "")
+              + (f", ended after seating on {res['post_seat_stop']}" if res.get("post_seat_stop") else ""))
         st = arm.read()
         arm.goto(st.tool_pos + np.array([0.0, 0.0, 0.06]), st.tool_R, 3.0)  # pull the peg out
         if res["outcome"] == "safety_stop" and not args.air:

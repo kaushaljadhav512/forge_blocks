@@ -278,6 +278,37 @@ class TestAttempt(unittest.TestCase):
         with self.assertRaises(fb.SafetyStop):
             mon.check(tip, 5.0, 0.01, tilted)
 
+    def test_tilt_after_seating_ends_as_seated(self):
+        c, s = math.cos(math.radians(12.0)), math.sin(math.radians(12.0))
+        tilted = np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]) @ fb.DOWN
+
+        class TipsWhenSeated(FakeArm):
+            def read(self):
+                if self.streaming and self.tip[2] < RIM[2] + fb.SEATED_TIP_ABOVE_RIM + 0.0005:
+                    self.R = tilted
+                return super().read()
+
+        res, _ = attempt(TipsWhenSeated(), make_runner())
+        self.assertEqual(res["outcome"], "seated", res)
+        self.assertTrue(res["success"])
+        self.assertIsNone(res["error"])
+        self.assertIn("tilt", res["post_seat_stop"])
+
+    def test_tilt_before_seating_is_a_safety_stop(self):
+        c, s = math.cos(math.radians(12.0)), math.sin(math.radians(12.0))
+        tilted = np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]) @ fb.DOWN
+
+        class TipsHigh(FakeArm):
+            def read(self):
+                if self.streaming and self.tip[2] < RIM[2] + fb.START_ABOVE_RIM - 0.01:
+                    self.R = tilted
+                return super().read()
+
+        res, _ = attempt(TipsHigh(), make_runner())
+        self.assertEqual(res["outcome"], "safety_stop", res)
+        self.assertFalse(res["success"])
+        self.assertIn("tilt", res["error"])
+
     def test_misaligned_estimate_rests_on_rim_and_times_out(self):
         arm = FakeArm()
         res, _ = attempt(arm, make_runner(), est=RIM + [0.004, 0.0, 0.0])
