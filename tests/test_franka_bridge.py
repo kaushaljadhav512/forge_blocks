@@ -850,6 +850,18 @@ class TestCalibration(unittest.TestCase):
             yaw = math.atan2(R[1, 0], R[0, 0])
             self.assertLessEqual(abs(yaw), fb.START_YAW_NOISE + 1e-9)
 
+    def test_start_over_estimate_is_exactly_above_it(self):
+        hole = fb.Hole(seated_tip=(RIM + [0, 0, fb.SEATED_TIP_ABOVE_RIM]).tolist())
+        cfg = fb.BridgeConfig()
+        est = hole.rim + [0.012, -0.005, -0.015]
+        for seed in range(20):
+            pos0, R0 = fb.sample_start(hole, np.random.default_rng(seed), cfg)
+            pos1, R1 = fb.sample_start(hole, np.random.default_rng(seed), cfg, centre_xy=est)
+            tip0, tip1 = fb.tool_to_tip(pos0, R0), fb.tool_to_tip(pos1, R1)
+            np.testing.assert_allclose(tip1[:2], est[:2], atol=1e-12)  # exactly above the estimate
+            self.assertAlmostEqual(tip1[2], tip0[2], places=12)  # height from the true rim
+            np.testing.assert_allclose(R1, R0)
+
     def test_hole_rim(self):
         hole = fb.Hole(seated_tip=[0.5, 0.0, 0.035], samples=[[0.5, 0.0, 0.035], [0.5004, 0.0, 0.035]])
         np.testing.assert_allclose(hole.rim, [0.5, 0.0, 0.035 - fb.SEATED_TIP_ABOVE_RIM])

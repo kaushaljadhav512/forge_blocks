@@ -769,10 +769,19 @@ def sample_error(r_min, r_max, rng) -> np.ndarray:
     return (r_min + (r_max - r_min) * rng.random()) * d / max(np.linalg.norm(d), 1e-9)
 
 
-def sample_start(hole: Hole, rng, cfg: BridgeConfig):
+def sample_start(hole: Hole, rng, cfg: BridgeConfig, centre_xy=None):
     """Factory randomize_initial_state: above the TRUE rim, uniform noise, yaw noise about yaw 0.
-    Returns the FrankaPy tool pose (pos, R) to move to."""
-    tip = hole.rim + np.array([0.0, 0.0, START_ABOVE_RIM]) + (2 * rng.random(3) - 1) * np.asarray(START_NOISE)
+    Returns the FrankaPy tool pose (pos, R) to move to.
+
+    centre_xy: start exactly above this xy instead, with no xy noise (e.g. the hole estimate: start where
+    the robot thinks the hole is, so every trial starts exactly one error away from the true hole). Height
+    and yaw noise stay. The height stays relative to the true rim: an estimate up to 15 mm too low would
+    otherwise put the peg below the top face at the start pose. The rng draws are the same either way, so
+    a seed gives the same errors, heights and yaws with or without it."""
+    noise = (2 * rng.random(3) - 1) * np.asarray(START_NOISE)
+    tip = hole.rim + np.array([0.0, 0.0, START_ABOVE_RIM]) + noise
+    if centre_xy is not None:
+        tip[:2] = np.asarray(centre_xy, dtype=float)[:2]
     R = down_with_yaw((2 * rng.random() - 1) * START_YAW_NOISE)
     return tip_to_tool(tip, R, cfg.tip_offset), R
 

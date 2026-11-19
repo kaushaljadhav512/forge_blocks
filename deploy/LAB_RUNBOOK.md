@@ -563,6 +563,21 @@ python3 deploy/run_peg.py summary
 | 1–2.5 | 96.3 % | | 10.5 N / | |
 | 2.5–5 | 86.0 % | | 10.7 N / | |
 
+### 3.9b Larger errors, start over the estimate (session 4)
+
+The bands above start the hand within ±2 cm of the **true** hole (the paper's and the sim's protocol),
+so at large errors a trial can start right over the hole by chance (session 4, 10–15 mm trial 4). With
+`--start_over_estimate` the hand starts **exactly above the estimate** in xy (no xy noise), so every trial
+starts exactly one error away from the true hole: a pure test of the policy's search. Height and yaw noise
+stay (height from the true rim, for clearance). Same seed = same errors as without it; results get an
+`@est` band label so `summary` keeps them apart. Narrower than training's start distribution (±2 cm).
+
+```bash
+python3 deploy/run_peg.py run --export exports/peg_fric_curr_seed2 --band 5 7.5 --trials 20 --start_over_estimate --ack-safety --auto
+python3 deploy/run_peg.py run --export exports/peg_fric_curr_seed2 --band 7.5 10 --trials 20 --start_over_estimate --ack-safety --auto
+python3 deploy/run_peg.py run --export exports/peg_fric_curr_seed2 --band 10 15 --trials 20 --start_over_estimate --ack-safety --auto
+```
+
 ### 3.10 Finish and send back
 
 ```bash

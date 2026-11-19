@@ -183,6 +183,9 @@ def main(argv=None):
     a.add_argument("--trials", type=int, default=1)
     a.add_argument("--seed", type=int, default=0)
     a.add_argument("--auto", action="store_true", help="don't ask before each trial (only after supervised runs)")
+    a.add_argument("--start_over_estimate", action="store_true",
+                   help="start exactly above the hole estimate in xy (no xy noise; height and yaw noise "
+                        "stay, height from the true rim); bands get an '@est' label")
     a.add_argument("--pred_threshold", type=float, help="end an attempt when the success prediction exceeds this "
                    "(default: never; the attempt ends on seating, a timeout or a safety stop)")
     add("summary")
@@ -455,6 +458,8 @@ def run_trials(arm, runner, hole, cfg, args):
     tilt_streak = 0
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     label = "air" if args.air else f"{args.band[0]:g}-{args.band[1]:g}"
+    if args.start_over_estimate and not args.air:
+        label += "@est"  # its own row in summary: not comparable with the sim's / paper's start distribution
     results_path = args.dir / "results.jsonl"
     for k in range(args.trials):
         if args.air:
@@ -462,7 +467,8 @@ def run_trials(arm, runner, hole, cfg, args):
         else:
             err = fb.sample_error(args.band[0] / 1000, args.band[1] / 1000, rng)
         hole_est = hole.rim + err
-        start_pos, start_R = fb.sample_start(hole, rng, cfg)
+        start_pos, start_R = fb.sample_start(hole, rng, cfg,
+                                             centre_xy=hole_est if args.start_over_estimate and not args.air else None)
         if args.air:
             start_pos = start_pos + err  # start above the (raised) estimate
         st = arm.read()
