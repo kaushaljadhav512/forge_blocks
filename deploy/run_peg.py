@@ -183,6 +183,8 @@ def main(argv=None):
     a.add_argument("--trials", type=int, default=1)
     a.add_argument("--seed", type=int, default=0)
     a.add_argument("--auto", action="store_true", help="don't ask before each trial (only after supervised runs)")
+    a.add_argument("--skip", type=int, default=0,
+                   help="draw and discard this many trials first: --seed S --skip 11 --trials 9 runs trials 12-20 of seed S")
     a.add_argument("--start_over_estimate", action="store_true",
                    help="start exactly above the hole estimate in xy (no xy noise; height and yaw noise "
                         "stay, height from the true rim); bands get an '@est' label")
@@ -461,7 +463,7 @@ def run_trials(arm, runner, hole, cfg, args):
     if args.start_over_estimate and not args.air:
         label += "@est"  # its own row in summary: not comparable with the sim's / paper's start distribution
     results_path = args.dir / "results.jsonl"
-    for k in range(args.trials):
+    for k in range(args.skip + args.trials):
         if args.air:
             err = np.array([0.0, 0.0, 0.10])
         else:
@@ -469,12 +471,14 @@ def run_trials(arm, runner, hole, cfg, args):
         hole_est = hole.rim + err
         start_pos, start_R = fb.sample_start(hole, rng, cfg,
                                              centre_xy=hole_est if args.start_over_estimate and not args.air else None)
+        if k < args.skip:  # drawn and discarded: trial k+1 onward matches the run without --skip
+            continue
         if args.air:
             start_pos = start_pos + err  # start above the (raised) estimate
         st = arm.read()
         lift = st.tool_pos.copy()
         lift[2] = max(lift[2], start_pos[2] + 0.03)
-        print(f"trial {k + 1}/{args.trials} [{label}] error {np.round(err * 1000, 2).tolist()} mm")
+        print(f"trial {k + 1}/{args.skip + args.trials} [{label}] error {np.round(err * 1000, 2).tolist()} mm")
         if not args.auto:
             confirm("Peg grasped and out of the hole, workspace clear, E-stop ready?")
         arm.goto(lift, st.tool_R, 3.0)
